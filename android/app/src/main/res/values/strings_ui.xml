@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Setup checklist -->
+    <string name="ui_server_hint">https://your-server.example.com</string>
+    <string name="ui_token_hint">Pairing token</string>
+    <string name="ui_cancel">Cancel</string>
+    <string name="ui_invalid_server">Use an https:// address (plain http:// only for a server on this phone or your local network)</string>
+    <string name="ui_connect_title">Connect to %1$s?</string>
+    <string name="ui_connect_body">%1$s will be able to control this phone: see its screen, and tap, type, swipe and open apps for you. Only continue if you set this server up or trust it.</string>
+    <string name="ui_connect_replaces">This disconnects the phone from %1$s, which it\'s paired with now. You\'ll confirm with your screen lock.</string>
+    <string name="ui_token_link_refused">This link uses a developer token, which links can\'t set. Pair by scanning the QR code from your dashboard, or enter the token in the app.</string>
+    <string name="ui_replace_title">Replace this phone\'s pairing</string>
+    <string name="ui_approve_replace">This replaces the pairing with %1$s. The agent on %2$s will be able to see your screen and tap, type, swipe and open apps for you. Confirm it\'s you.</string>
+    <string name="ui_missing_token">Enter the pairing token from your dashboard</string>
+    <string name="ui_paired_token">Paired with your server by developer token.</string>
+    <string name="ui_bad_link">That pairing link is not valid. Scan the QR code again.</string>
+
+    <string name="ui_step_a11y_done">OpenMob accessibility is on.</string>
+    <string name="ui_restricted_why">One-time approval for an APK installed outside the Play Store:</string>
+    <string name="ui_restricted_steps">Open App info → ⋮ → Allow restricted settings → confirm.\n\nReturn to OpenMob, then tap Open Accessibility → Installed apps (or Downloaded apps) → OpenMob → On → Allow.</string>
+    <string name="ui_restricted_button">Open App info</string>
+
+    <!-- Connection -->
+    <string name="ui_connect">Connect</string>
+    <string name="ui_live_view">Smooth live view</string>
+    <string name="ui_live_view_help">Offers screen sharing the first time someone opens this phone\'s live view, so your dashboard shows smooth video (Android asks each time you connect). Off: the dashboard shows a few screenshots a second and never asks.</string>
+    <string name="ui_live_view_declined">Smooth live view is off. Turn it on under Connection any time.</string>
+    <string name="ui_disconnect">Disconnect</string>
+    <string name="ui_pair_first">Pair with your agent server first.</string>
+    <string name="ui_a11y_warning">Accessibility is off, so the agent can\'t see or control the screen yet.</string>
+
+    <!-- Ask -->
+    <string name="ui_speech_prompt">What should your agent do?</string>
+    <string name="ui_no_speech">No speech recognizer is installed on this phone.</string>
+    <string name="ui_not_connected">Not connected to your agent.</string>
+
+    <!-- Activity -->
+    <string name="ui_yes">Yes</string>
+    <string name="ui_no">No</string>
+
+    <!-- Footer -->
+    <string name="ui_device_id">Device ID: %1$s</string>
+
+    <!-- Account pairing (QR code with a one-time code) -->
+    <string name="ui_unpair">Unpair this phone</string>
+    <string name="ui_unpair_title">Unpair this phone?</string>
+    <string name="ui_unpair_body">Your agent will no longer be able to control this phone. To use it again, scan a new code from your dashboard.</string>
+    <string name="ui_unpaired">This phone is no longer paired.</string>
+    <string name="ui_signin_explain">Sign in to your OpenMob account. This phone keeps only its own key, never your sign-in.</string>
+    <string name="ui_email_hint">Email</string>
+    <string name="ui_password_hint">Password</string>
+    <string name="ui_signin">Sign in</string>
+    <string name="ui_create_account">Create account</string>
+    <string name="ui_signin_missing">Enter your email and password.</string>
+    <string name="ui_invite_hint">Invite code (only to create an account)</string>
+    <string name="ui_invite_missing">Creating an account needs an invite code. Ask whoever runs your OpenMob server.</string>
+    <string name="ui_approve_description">The agent on this server will be able to see your screen and tap, type, swipe and open apps for you while you\'re connected. Only continue if you started this.</string>
+    <string name="ui_need_screen_lock_title">Set a screen lock first</string>
+    <string name="ui_need_screen_lock">For your security, OpenMob only pairs on phones with a screen lock (PIN, pattern, password or fingerprint), so only you can approve an agent. Set one up in Settings, then scan the code again.</string>
+    <string name="ui_open_security_settings">Open Settings</string>
+    <string name="ui_ok">OK</string>
+    <string name="ui_pair_cancelled">Pairing cancelled. Scan the code again when you\'re ready.</string>
+    <string name="ui_pair_failed_title">Couldn\'t pair this phone</string>
+    <string name="ui_pair_error_generic">Something went wrong while pairing. Try again, or make a new code on your dashboard.</string>
+    <string name="ui_pair_error_rate">Too many tries. Try again in a few minutes.</string>
+    <string name="ui_pair_error_network">Couldn\'t reach the server. Check the connection and the server address.</string>
+    <string name="ui_pair_error_code">That code didn\'t work. Check it on your dashboard, or make a new one there.</string>
+    <string name="ui_pair_error_no_accounts">This server doesn\'t use accounts.</string>
+    <string name="pair_channel">Pairing</string>
+    <string name="pair_notification_title">Paired with %1$s</string>
+    <string name="pair_notification_text">on %1$s. Not you? Undo unpairs this phone right away.</string>
+    <string name="pair_undo">Undo</string>
+    <string name="pair_unpair_failed">Removed on this phone; also remove it on the dashboard.</string>
+    <string name="ui_pair_new_code">Generate a new code on your dashboard and scan again.</string>
+    <string name="ui_paired_as_toast">Paired with %1$s as %2$s</string>
+
+    <!-- Home-screen shortcuts and the Quick Settings tile -->
+    <string name="shortcut_a11y_short">Accessibility</string>
+    <string name="shortcut_a11y_long">Turn on Accessibility</string>
+    <string name="shortcut_connect_short">Connect</string>
+    <string name="shortcut_connect_long">Connect to my agent</string>
+    <string name="shortcut_ask_short">Ask</string>
+    <string name="shortcut_ask_long">Ask my agent</string>
+    <string name="shortcut_need_pairing">Pair this phone first: scan the QR code on your dashboard.</string>
+    <string name="shortcut_need_connection">Connect to your agent first.</string>
+    <string name="tile_turn_on_accessibility">Turn on Accessibility</string>
+    <string name="tile_tap_to_connect">Tap to connect</string>
+    <string name="tile_connected">Connected</string>
+    <string name="tile_in_use">%1$s is using it</string>
+
+    <!-- Connection notification and "who's using my phone" -->
+    <string name="notif_title">OpenMob · your agent can use this phone</string>
+    <string name="notif_disconnect">Disconnect</string>
+    <string name="notif_stop">Stop and disconnect</string>
+    <string name="notif_connecting">Connecting to your agent…</string>
+    <string name="notif_ready">Connected · ready for your agent</string>
+    <string name="notif_reconnecting">Reconnecting to your agent…</string>
+    <!-- Review 4 M3: the ongoing line while the phone is locked or its screen is off (no task text on the lock screen) -->
+    <string name="notif_working_locked">OpenMob is working</string>
+    <string name="controller_using">%1$s is using your phone</string>
+    <string name="controller_stopped">%1$s stopped using your phone</string>
+
+    <!-- The agent's question in words (AgentQuestion): a heads-up while it waits for the owner's answer -->
+    <string name="question_channel">Your agent\'s questions</string>
+    <string name="question_channel_description">Tells you when your agent stops to ask you something. You answer in OpenMob.</string>
+    <string name="question_notification_public">Your agent has a question</string>
+    <string name="question_waiting">Waiting for your answer</string>
+    <!-- Review 4 M3 and L10: the heads-up never carries the question itself (lock screen, watches, other apps) -->
+    <string name="question_notification_text">Tap to answer in OpenMob. Never type passwords or codes in an answer.</string>
+
+    <!-- Approvals for risky actions -->
+    <string name="approval_channel">Approvals</string>
+    <string name="approval_channel_description">Asks you before your agent buys, sends or deletes something.</string>
+    <string name="approval_notification_text">%1$s is asking. Review to approve with your screen lock.</string>
+    <string name="approval_notification_text_gate">This phone stopped the agent to ask you. Review to approve with your screen lock.</string>
+    <string name="approval_notification_sub">Approval needed</string>
+    <string name="approval_notification_public">OpenMob needs your approval</string>
+    <string name="approval_deny">Deny</string>
+    <string name="approval_review">Review</string>
+    <string name="approval_approve">Approve</string>
+    <string name="approval_label">APPROVAL NEEDED</string>
+    <string name="approval_requester">Asked by %1$s</string>
+    <string name="approval_explain">Approving needs your screen lock, so the AI using your phone can\'t approve this itself. If you didn\'t expect this, deny it.</string>
+    <string name="approval_prompt_title">Approve this action?</string>
+    <string name="approval_not_confirmed">Not approved. Tap Approve to try again, or Deny.</string>
+    <string name="approval_need_lock">Approving needs a screen lock (PIN, pattern, password or fingerprint). Set one up in Settings, or deny this request.</string>
+    <string name="approval_gone">This request was already answered or has expired.</string>
+    <string name="approval_offline">Not connected to your agent, so the answer wasn\'t sent. Reconnect and try again.</string>
+    <string name="approval_sent_approved">Approved</string>
+    <string name="approval_sent_denied">Denied</string>
+    <string name="approval_no_question">Allow a risky action?</string>
+    <string name="approval_unknown_requester">Your agent</string>
+    <string name="approval_event_asked">%1$s asks: %2$s</string>
+    <string name="approval_event_approved">Approved: %1$s</string>
+    <string name="approval_event_denied">Denied: %1$s</string>
+    <string name="approval_event_expired">Expired without an answer: %1$s</string>
+
+    <!-- Setup: background running and restricted settings -->
+    <string name="ui_restricted_missing">No \"Allow restricted settings\" option? Tap Open Accessibility below, select OpenMob and try its switch once. Then return to Open App info.</string>
+
+    <!-- Permission modes (docs/safety.md#permission-modes) -->
+    <string name="approval_label_mode">CHANGE HOW AGENTS ASK</string>
+    <string name="approval_explain_mode">Agents would ask you less on this phone. This needs your screen lock. If you didn\'t ask for this from your dashboard or an app you trust, deny it.</string>
+    <string name="approval_prompt_title_mode">Allow this permission change?</string>
+    <string name="approval_label_plan">APPROVE A PLAN</string>
+    <string name="approval_explain_plan">Approving lets your agent carry out these steps. Anything risky that isn\'t in the plan, and any payment, will still ask you. To change the plan, deny it and type what to change in the chat.</string>
+    <string name="approval_prompt_title_plan">Approve this plan?</string>
+    <string name="approval_label_step">APPROVE THE NEXT STEP</string>
+    <string name="approval_always">Always allow this</string>
+    <string name="approval_cannot">This phone can\'t approve yet. Update the OpenMob app and reconnect; until then you can only deny.</string>
+    <string name="approval_mismatch">This request doesn\'t match the action it describes, so it can\'t be approved. Deny it.</string>
+    <string name="approval_no_key">This phone has no approval key (it goes away if the screen lock is removed), so it can\'t approve. Reconnect or pair again to approve; you can still deny.</string>
+    <string name="approval_always_confirm_title">Allow payments without asking?</string>
+    <string name="approval_always_confirm_body">%1$s You can turn it off any time in the dashboard\'s phone settings.</string>
+    <string name="approval_always_confirm_yes">Allow payments</string>
+    <string name="approval_always_confirm_no">Just this once</string>
+    <string name="never_banner">Don\'t ask: agents act without asking until %1$s</string>
+    <string name="never_banner_money">Don\'t ask, including purchases, until %1$s</string>
+    <string name="approval_explain_mode_money">Agents would act without asking on this phone, and could also buy, pay and subscribe with your saved payment methods until this ends. This needs your screen lock. If you didn\'t ask for this, deny it.</string>
+    <string name="approval_money_confirm_title">Also allow purchases?</string>
+    <string name="approval_money_confirm_body">Agents could make purchases on this phone without asking you until Don\'t ask ends. Blocked apps stay blocked. Only allow this if you trust what\'s driving the phone.</string>
+    <string name="approval_money_confirm_yes">Allow purchases</string>
+    <string name="approval_money_confirm_no">Cancel</string>
+    <string name="never_turn_off">Turn off</string>
+    <string name="never_turned_off">Agents will ask you again on this phone.</string>
+
+    <!-- Pairing: one screen-lock prompt naming the server and account -->
+    <string name="ui_checking_code">Checking the code with %1$s…</string>
+    <string name="ui_approve_title_host">Connect this phone to %1$s?</string>
+    <string name="ui_approve_as">as %1$s</string>
+    <string name="ui_approve_replaces">This replaces its pairing with %1$s.</string>
+
+    <!-- Setup: background running (Why?) and Samsung\'s extra list -->
+    <string name="ui_samsung_sleep">Samsung: also add OpenMob to \"Never sleeping apps\"</string>
+    <string name="ui_samsung_sleep_hint">Background usage limits › Never sleeping apps › + › OpenMob</string>
+
+    <!-- Setup: screen sharing, offered only once someone opens the live view -->
+    <string name="ui_step_screen_title">Share the screen for the live view</string>
+    <string name="ui_step_screen_body">Someone opened this phone\'s live view. Share the screen to show it as smooth video; Android asks again each time you connect.</string>
+    <string name="ui_step_screen_button">Share screen</string>
+    <string name="live_view_offer_title">Show this screen on your dashboard?</string>
+    <string name="live_view_offer_text">Tap to share it as smooth video. Until then the live view shows screenshots.</string>
+    <!-- The gatekeeper (docs/design/phone-gatekeeper.md) -->
+    <string name="gate_requester">This phone</string>
+    <string name="gate_event_asked">Asked on this phone: %1$s</string>
+    <string name="gate_server_says">Server says: “%1$s”</string>
+    <string name="gate_explain">This phone stopped the agent to ask you. The question and the picture come from what this phone sees, not from the server. Approving needs your screen lock and allows this one action only.</string>
+    <string name="lock_paused_title">Unlock your phone to continue</string>
+    <string name="lock_paused_text">Your agent paused because the phone locked. It carries on when you unlock it.</string>
+    <string name="lock_paused_event">The phone locked mid-task. Unlock it to continue.</string>
+    <string name="lock_resumed_event">Unlocked: the agent carries on.</string>
+    <string name="gate_resume">Resume</string>
+    <string name="owner_dialog_title">Your answer is needed on the phone</string>
+    <string name="owner_dialog_locked">Unlock your phone to see what it is.</string>
+    <string name="gate_prompt_interrupted">Interrupted. The screen lock prompt comes back in a moment; or tap Approve or Deny.</string>
+    <string name="gate_always_for">Always allow for %1$s</string>
+    <string name="gate_mode_change_limited">A permission change request was ignored: at most 2 an hour can be asked on this phone.</string>
+    <!-- The agent indicator (IndicatorOverlay, MainActivity's Agent indicator card) -->
+    <string name="indicator_stop">■ Stop</string>
+    <string name="indicator_stop_description">Stop the agent</string>
+    <string name="indicator_stopped_event">You stopped the agent with the Stop button. Still connected: ask for something else any time.</string>
+    <string name="indicator_stopped_offline">You stopped the agent with the Stop button. The phone refuses its actions until the task ends.</string>
+    <string name="indicator_border">Glowing border</string>
+    <string name="indicator_color">Border colour</string>
+    <string name="indicator_custom_hint">#RRGGBB, e.g. #00B8D4</string>
+    <string name="indicator_custom_invalid">Use six hex digits, like #00B8D4.</string>
+    <string name="indicator_pulse">Gentle pulse</string>
+    <string name="indicator_pulse_help">Off whenever Android\'s Remove animations is on.</string>
+    <string name="indicator_pill">Stop button</string>
+    <string name="indicator_corner_top_right">Top right</string>
+    <string name="indicator_corner_top_left">Top left</string>
+    <string name="indicator_corner_bottom_right">Bottom right</string>
+    <string name="indicator_corner_bottom_left">Bottom left</string>
+    <string name="indicator_preview">Preview for 4 seconds</string>
+    <!-- Faster mode (docs/design/faster-mode.md): its own card and notification line. -->
+    <string name="faster_warning">Faster mode sends screenshots of what the agent is looking at to TypeSafe, a second AI service, so it can recognize screens faster. On routine game screens, TypeSafe may also tap a start, continue or close button itself, through the same checks as the agent\'s taps; for that, your request\'s text goes with the screenshot. Banking, wallet and password apps, and screens the phone blacks out, are never sent. OpenMob blocks banking apps and detected card and ID numbers, but it can\'t recognize every sensitive image. You can turn this off at any time.</string>
+    <string name="faster_learn_more">What is sent, and what never is</string>
+    <string name="faster_status_off">Off. Screenshots stay between this phone, your OpenMob server and the AI model you chose.</string>
+    <string name="faster_status_phone">On, always on this phone.</string>
+    <string name="faster_status_session">On for this session: until you disconnect, or an hour without agent activity.</string>
+    <string name="faster_on_session">Turn on for this session</string>
+    <string name="faster_on_always">Always on this phone</string>
+    <string name="faster_turn_off">Turn off Faster mode</string>
+    <string name="faster_on_banner">Faster mode is on</string>
+    <string name="faster_asked">Approve Faster mode with your screen lock in the prompt that opens.</string>
+    <string name="faster_offline">Connect to your agent first.</string>
+    <string name="faster_turned_off">Faster mode is off: no more screenshots go to TypeSafe.</string>
+    <string name="faster_not_approved">The server said Faster mode was on, but it wasn\'t approved on this phone, so the phone turned it off.</string>
+    <string name="faster_declined_mixed">Declined a Faster mode change that came with other permission changes. Turn Faster mode on by itself.</string>
+    <string name="faster_declined_unasked">Declined a Faster mode change you didn\'t just ask for on this phone.</string>
+</resources>

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set Up OpenMob</title>
+<script>try { const t = localStorage.getItem("openmob.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+<link rel="stylesheet" href="/static/ds.css">
+<style>
+  /* This page opens on the phone, often on mobile data: no web fonts, the system font is used. */
+  /* ---------- pair (on the phone) ---------- */
+  body { font-size: 16px; }
+  main { max-width: 480px; margin: 0 auto; padding: 24px var(--gutter) 40px; }
+  .brand { margin-bottom: 14px; font-size: 19px; }
+  h1 { font-size: 24px; letter-spacing: -.02em; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 20px; }
+  .step { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 16px; margin-bottom: 12px; box-shadow: var(--shadow-sm); }
+  .step h2 { font-size: 16px; margin: 0 0 6px; display: flex; gap: 10px; align-items: center; }
+  .num { width: 26px; height: 26px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 14px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  .step p { margin: 0 0 12px; color: var(--muted); font-size: 15px; }
+  .step p:last-child { margin-bottom: 0; }
+  .err { color: var(--warn); font-size: 15px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="6.5" y="2.5" width="11" height="19" rx="3"/><path d="M10.5 18h3"/></svg></span>OpenMob</div>
+  <h1>Set up this phone</h1>
+  <p class="sub">Let your AI agent use this phone. Takes about a minute.</p>
+
+  <div class="step">
+    <h2><span class="num">1</span>Install the app</h2>
+    <p id="apkText">Download OpenMob, then open the file and allow installs from your browser if Android asks.</p>
+    <a class="btn btn-lg btn-block" id="apk" href="#">Download OpenMob.apk</a>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">2</span>Pair it with your agent</h2>
+    <p>Opens the app with this server and code already filled in.</p>
+    <a class="btn btn-primary btn-lg btn-block" id="open" href="#">Open OpenMob</a>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">3</span>Follow the app's checklist</h2>
+    <p>Turn on OpenMob under Accessibility (so the agent can see the screen and tap), allow notifications and background use. You can disconnect any time from the notification.</p>
+  </div>
+  <p class="err" id="err" role="alert" hidden></p>
+</main>
+<script>
+// Everything the phone needs is in this page's own address (?code=… or legacy ?t=…), so it never
+// calls a signed-in API and can't mint codes itself.
+const params = new URLSearchParams(location.search);
+const code = params.get("code") || "";
+const token = params.get("t") || "";
+const err = (message) => { const el = document.getElementById("err"); el.textContent = message; el.hidden = false; };
+const server = encodeURIComponent(location.origin);
+if (code) {
+  document.getElementById("open").href = `openmob://connect?server=${server}&code=${encodeURIComponent(code)}`;
+  document.querySelector("#open").closest(".step").querySelector("p").textContent =
+    `Opens the app with your one-time code (it works for 2 minutes). The app asks once, with your fingerprint or PIN, to connect this phone to ${location.host} as your account. No sign-in needed.`;
+} else if (token) {
+  // Links can't set a developer token (a web page could hijack the phone that way): type it in the app.
+  document.getElementById("open").hidden = true;
+  document.querySelector("#open").closest(".step").querySelector("p").textContent =
+    `In the app, tap "Pair with your agent server" and enter the server ${location.origin} and the token from \`openmob run\`.`;
+} else {
+  document.getElementById("open").hidden = true;
+  err("This pairing link is incomplete. Scan the QR code on your dashboard's Connect page again.");
+}
+fetch("/download/openmob.apk", { method: "HEAD", cache: "no-store" }).then((r) => {
+  // The build in the link: a browser or phone never hands back a cached copy of an older app.
+  const v = r.headers.get("X-OpenMob-Apk-Version");
+  if (r.ok) { document.getElementById("apk").href = "/download/openmob.apk" + (v ? "?v=" + encodeURIComponent(v) : ""); return; }
+  document.getElementById("apk").hidden = true;
+  document.getElementById("apkText").textContent = "The app isn't available from this server yet. Ask whoever runs it to build it.";
+}).catch(() => {});
+</script>
+</body>
+</html>

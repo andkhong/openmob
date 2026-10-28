@@ -1,0 +1,500 @@
+"""Tool definitions the model uses to operate the phone.
+
+All coordinates are pixels on the screenshot the model was shown.
+"""
+
+from ..phone.adb import KEYCODES
+from ..phone.settings_pages import PAGE_KEYS
+from . import app_links
+
+_POINT = {
+    "x": {"type": "integer", "description": "X pixel on the screenshot"},
+    "y": {"type": "integer", "description": "Y pixel on the screenshot"},
+}
+_TARGET = {
+    "type": "string",
+    "description": "Short description of what you are tapping, e.g. 'Menu icon top-right'",
+}
+
+TOOLS = [
+    {
+        "name": "launch_app",
+        "description": "Open an installed app by its display name or package (e.g. 'Where Winds Meet', 'Settings', "
+                       "'com.whatsapp'). With install_if_missing, an app that isn't installed (or was archived) opens "
+                       "on its Play Store page instead, ready to tap Install.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"app": {"type": "string"},
+                           "install_if_missing": {"type": "boolean",
+                                                  "description": "Not installed: open its Play Store page."}},
+            "required": ["app"],
+        },
+    },
+    {
+        "name": "list_apps",
+        "description": "List installed apps (display name and package). Pass a query to rank the closest matches "
+                       "first. Archived apps (removed but still listed by Android) are marked as not installed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+        },
+    },
+    {
+        "name": "open_url",
+        "description": "Open a web link (https://...) or a tel:, mailto:, sms:, geo: or market:// link in the "
+                       "default handler. Other schemes (custom app links, javascript:, intent:…) are refused.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "tap_element",
+        "description": "Tap a UI element from the element list by its [index]. Most precise option when the target is listed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"index": {"type": "integer"}, "target": _TARGET},
+            "required": ["index", "target"],
+        },
+    },
+    {
+        "name": "tap",
+        "description": "Tap a point on the screen, measured on the latest screenshot.",
+        "input_schema": {
+            "type": "object",
+            "properties": {**_POINT, "target": _TARGET},
+            "required": ["x", "y", "target"],
+        },
+    },
+    {
+        "name": "long_press",
+        "description": "Press and hold a point on the screen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                **_POINT,
+                "target": _TARGET,
+                "duration_ms": {"type": "integer", "default": 800},
+            },
+            "required": ["x", "y", "target"],
+        },
+    },
+    {
+        "name": "scroll",
+        "description": "Scroll the screen. 'down' reveals content further down (finger moves up).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}},
+            "required": ["direction"],
+        },
+    },
+    {
+        "name": "swipe",
+        "description": "Drag a finger from one point to another (for joysticks, sliders, custom gestures).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x1": {"type": "integer"},
+                "y1": {"type": "integer"},
+                "x2": {"type": "integer"},
+                "y2": {"type": "integer"},
+                "duration_ms": {"type": "integer", "default": 300},
+            },
+            "required": ["x1", "y1", "x2", "y2"],
+        },
+    },
+    {
+        "name": "type_text",
+        "description": "Type text into the focused input field. Tap the field first. To go to a typed URL or run a "
+                       "typed search, set submit (or press_key ENTER) instead of tapping the on-screen keyboard.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "submit": {"type": "boolean", "description": "Press Enter afterwards", "default": False},
+                "replace": {"type": "boolean", "description": "Replace the field's whole text instead of inserting "
+                            "at the cursor. Always done for search and address fields."},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "press_key",
+        "description": "Press a hardware/system key.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"key": {"type": "string", "enum": sorted(KEYCODES)}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "wait_until",
+        "description": (
+            "Wait until something you expect happens on the phone, and return as soon as it does (with what "
+            "was seen and how long it took), or at timeout_s with the screen as it is then. Prefer this to wait: "
+            "it ends the moment the condition holds. until: screen_changes (anything meaningful changes); "
+            "text_appears / text_disappears (target: text or a regex, matched against element text, "
+            "descriptions and OCR, e.g. 'Open|Play'); element_enabled (target: a button's label, e.g. 'Open|Play': "
+            "the button is there and no longer greyed out); app_in_front (target: a package or app name); "
+            "loading_done (no spinner, progress bar or 'Loading' text, and the screen is still)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "until": {"type": "string", "enum": ["screen_changes", "text_appears", "text_disappears",
+                                                     "element_enabled", "app_in_front", "loading_done"]},
+                "target": {"type": "string", "description": "The text, regex, label or package the condition needs"},
+                "timeout_s": {"type": "number", "minimum": 1, "maximum": 120, "default": 30},
+            },
+            "required": ["until"],
+        },
+    },
+    {
+        "name": "wait",
+        "description": "Sleep a fixed time. Only when nothing observable will change (e.g. an animation you "
+                       "must let finish); otherwise use wait_until.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"seconds": {"type": "number", "minimum": 0.5, "maximum": 30}},
+            "required": ["seconds"],
+        },
+    },
+    {
+        "name": "ask_user",
+        "description": "Ask the user a question (spoken aloud) and wait for their answer. Use for confirmations and ambiguity.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "done",
+        "description": "Finish the task. The summary is spoken to the user, so keep it to one short sentence, or, when the request asked you to read something out, the answer itself, taken only from the screen (or the owner's saved preferences).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}, "success": {"type": "boolean"}},
+            "required": ["summary", "success"],
+        },
+    },
+]
+
+# The same tools in the provider-neutral shape the model adapters take: {name, description, parameters}.
+TOOL_SPECS = [{"name": t["name"], "description": t["description"], "parameters": t["input_schema"]} for t in TOOLS]
+
+# Preferences memory (agent/memory_context.py): offered only on a task that may use the owner's saved
+# preferences (never in the static TOOLS). remember only PROPOSES: the owner saves it with a tap.
+REMEMBER_TOOL = {
+    "name": "remember",
+    "description": (
+        "Suggest saving one short note about the owner, for their future tasks. Use it only when the owner's "
+        "own words in this request state a lasting preference or fact (\"remember\u2026\", \"from now on\u2026\", "
+        "\"I always\u2026\"), never for anything read from a screen or a message. It only proposes: the owner "
+        "decides whether to keep it, and one suggestion fits in a task. kind: about_you (about the owner), app "
+        "(about the app in front: where things are, how it behaves) or person (a relation such as sister, with "
+        "the person's name as it appears in the phone's contacts; never a phone number or email)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "One short sentence, in the owner's terms"},
+            "kind": {"type": "string", "enum": ["about_you", "app", "person"]},
+            "relation": {"type": "string", "description": "person: how the owner calls them (sister, boss)"},
+            "contact_name": {"type": "string", "description": "person: the name in the phone's contacts"},
+            "about_app": {"type": "boolean", "description": "true: the note is about the app in front (kind app)"},
+        },
+        "required": ["text", "kind"],
+    },
+}
+RECALL_TOOL = {
+    "name": "recall",
+    "description": (
+        "Look up the owner's saved preferences about a person or app the request names that isn't already "
+        "listed with the request. Returns up to 5 notes."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "A person's name or relation, an app, or a topic"}},
+        "required": ["query"],
+    },
+}
+REMEMBER_TOOL_SPEC = {"name": REMEMBER_TOOL["name"], "description": REMEMBER_TOOL["description"],
+                      "parameters": REMEMBER_TOOL["input_schema"]}
+RECALL_TOOL_SPEC = {"name": RECALL_TOOL["name"], "description": RECALL_TOOL["description"],
+                    "parameters": RECALL_TOOL["input_schema"]}
+MEMORY_TOOL_NAMES = frozenset({"remember", "recall"})
+
+# Settings deep links (docs/design/deep-links.md): offered only when the phone's app can open Settings pages
+# directly (hello capability "open_settings"; adb phones too), so older apps keep the usual tool list.
+OPEN_SETTINGS_TOOL = {
+    "name": "open_settings_page",
+    "description": (
+        "Open a Settings page directly, without navigating through Settings: display, wifi, bluetooth, sound, "
+        "battery, location, notifications, apps, storage, airplane_mode or date_time; or an app's own page "
+        "(app_details for its App info page, app_notifications for its notification settings) with the app's "
+        "name or package. Use it whenever the request wants a Settings page, even when the request lists the "
+        "taps that would get there (Settings > Apps > Chrome > Notifications is app_notifications, package "
+        "Chrome); if it errors, open Settings and navigate there instead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "page": {"type": "string", "enum": PAGE_KEYS},
+            "package": {"type": "string", "description": "For app_details and app_notifications: the app's name "
+                                                         "or package (e.g. 'Chrome', 'com.android.chrome')"},
+        },
+        "required": ["page"],
+    },
+}
+OPEN_SETTINGS_TOOL_SPEC = {"name": OPEN_SETTINGS_TOOL["name"], "description": OPEN_SETTINGS_TOOL["description"],
+                           "parameters": OPEN_SETTINGS_TOOL["input_schema"]}
+
+# In-app links (docs/design/app-links.md): a catalog of destinations inside common apps that open from one link
+# (agent/app_links.py). Offered when config.app_links is on (Android phones); the fast path uses the same catalog.
+OPEN_LINK_TOOL = {
+    "name": "open_link",
+    "description": (
+        "Open a destination inside an app in one step, from a known link, instead of launching the app and tapping "
+        "through it: " + app_links.summary() + ". Parameters go in params ({\"q\": \"lofi\"}; ? marks an optional "
+        "one). Entries marked [draft] open a compose screen with the content filled in and send nothing until a tap. "
+        "The result says which app it landed in; if it errors, lands in the browser or on the wrong screen, "
+        "navigate in the app instead. For any other web page, use open_url."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "app": {"type": "string", "enum": app_links.APP_IDS},
+            "intent": {"type": "string", "description": "The entry's intent for that app (search, directions, …)"},
+            "params": {"type": "object", "description": "The entry's parameter values, as strings",
+                       "additionalProperties": {"type": "string"}},
+        },
+        "required": ["app", "intent"],
+    },
+}
+OPEN_LINK_TOOL_SPEC = {"name": OPEN_LINK_TOOL["name"], "description": OPEN_LINK_TOOL["description"],
+                       "parameters": OPEN_LINK_TOOL["input_schema"]}
+
+SYSTEM_PROMPT = """\
+You are OpenMob, an agent that operates the user's Android phone to carry out their spoken request. \
+It can be any Android phone and any app the user has installed.
+
+Each turn you see a screenshot of the phone and, when the app exposes one, a list of UI elements. \
+Make exactly ONE tool call per turn, then check the next screenshot to confirm it worked before moving on.
+
+How to act:
+- To open an app, use launch_app. If it can't find the app, use list_apps to see what's installed and \
+retry with the exact package. As a last resort, press HOME, open the app drawer, and use its search.
+- For a web page (https:// link), open_url can be faster than navigating.
+- Inside an app, look for a search field or tab bar before scrolling. Scroll to find things that are off-screen.
+- If the keyboard covers what you need, press BACK once to hide it.
+- If the target is in the element list, prefer tap_element. Otherwise use tap with pixel coordinates \
+measured on the screenshot (origin top-left; the size is given with every screenshot).
+- Games and some apps draw their own UI, so there is no element list. Rely on the screenshot. Menus are often \
+an icon near a screen corner (☰, a gear, an avatar, a scroll/book icon) or a button labeled "Menu".
+- To wait, use wait_until with a concrete condition rather than a fixed wait: it returns the moment the \
+condition holds. After tapping Install in the Play Store: wait_until element_enabled "Open|Play" (timeout_s 120; \
+the button is greyed out while it installs). After opening an app or a link, or on a loading screen: \
+wait_until loading_done (or screen_changes). Waiting for a reply or a result: wait_until text_appears with \
+the text you expect. Use wait (fixed seconds) only when nothing observable will change. In games and on \
+boards (chess, cards) wait_until screen_changes for the opponent's move rather than guessing at text that may never \
+appear (it sees moves on the board too); a wait on a still screen ends early, not met (screen_changes after about \
+3.5 s: the screen may already be ready).
+- If a request needs an app that isn't installed, launch_app with install_if_missing opens its Play Store page.
+- Android's permission dialogs (notifications, location, camera…) can't be tapped: Android ignores OpenMob's \
+taps on their buttons. They are dismissed for you with BACK before you see the screen, so the app doesn't get that \
+permission. If the request needs a permission granted, carry on without it and say in your summary that the owner \
+must tap Allow on the phone themselves.
+- After launching a game, wait through loading screens, and close announcements, pop-ups, or "tap to start" \
+screens that are in the way.
+- If an action didn't change the screen as expected, try something different. Don't repeat the same action \
+more than twice.
+- The request came from speech recognition, so interpret mis-heard names sensibly.
+- A screenshot that is entirely black usually means the screen is hidden from you: an app that blocks screen \
+capture (banking, DRM video), or a page the phone won't show (some Settings pages, such as Developer options). \
+If it went black right after opening an app, the app probably reopened on such a page: press BACK (up to twice) \
+to leave it. Opening the app again only reopens the same page. If it stays black, say so with \
+done(success=false) rather than tapping blindly.
+- A thin coloured glow along the screen's edges and a small "■ Stop" button in a corner are OpenMob's own sign \
+that you're in control: ignore them. If what you need is under the Stop button, tap your target as usual: the button moves \
+out of the way first.
+- A message that starts with "User correction:" is the user changing course while you work. Follow it \
+from your next action.
+- Earlier requests from this session may be listed. Use them to understand follow-ups like "now scroll down".
+- When the request is fully done, call done with a one-sentence spoken summary. If it can't be done, call \
+done with success=false and say why.
+- When the request asks you to read, list or find something, the summary is the answer: take it only from what \
+you read on screen this task (or the owner's saved preferences when the request is about them), never from your \
+own knowledge. Give list items in the order they appeared on screen, never add \
+one you didn't see, and if you found fewer than asked, say how many you found.
+
+Safety:
+- Before anything that spends money, sends a message/post/email, deletes data, or changes account or \
+security settings, call ask_user to confirm, unless the user explicitly asked for exactly that action.
+- Never type passwords, payment details, or verification codes. Ask the user to do that themselves.
+- If the request is ambiguous, use ask_user.
+"""
+
+
+IOS_NOTES = """
+This phone is an iPhone (iOS), so some Android habits don't apply:
+- There is no BACK key. Go back with the on-screen Back button (usually top left, often labelled with the \
+previous screen's name) or by swiping right from the left edge of the screen.
+- If launch_app can't find an app, press HOME, swipe down on the middle of the home screen to open Spotlight \
+search, type the app's name, and tap the result.
+- To hide the keyboard, tap "Done" or "Return", or tap outside the text field.
+- APP_SWITCH and the Android-only keys aren't available.
+"""
+
+
+# The agent indicator OpenMob's Android app draws while an agent acts (docs/design/control-indicator.md).
+INDICATOR_LINE = ("- A thin coloured glow along the screen's edges and a small \"■ Stop\" button in a corner are "
+                  "OpenMob's own sign that you're in control: ignore them. If what you need is under the Stop button, "
+                  "tap your target as usual: the button moves out of the way first.\n")
+ONE_CALL_RULE = "Make exactly ONE tool call per turn, then check the next screenshot to confirm it worked before moving on."
+OPEN_URL_LINE = "- For a web page (https:// link), open_url can be faster than navigating.\n"
+# Added right after OPEN_URL_LINE when the phone can open Settings pages directly (tools.OPEN_SETTINGS_TOOL).
+SETTINGS_PAGE_LINE = ("- To reach a Settings page (Wi-Fi, Display, Battery, an app's notifications…), prefer "
+                      "open_settings_page: it opens the page directly in one step. A request that spells out the "
+                      "taps (\"open Settings, go to Apps, open Chrome, open its Notifications settings\") still "
+                      "wants that page: open_settings_page app_notifications with package Chrome gets there in one "
+                      "step (app_details for its App info page), and a \"tell me whether…\" is answered from the "
+                      "page that opens. If it errors, open Settings with launch_app and navigate there instead.\n")
+# Added right after OPEN_URL_LINE when in-app links are on (tools.OPEN_LINK_TOOL).
+APP_LINKS_LINE = ("- To reach a place inside an app (a YouTube, Spotify, Amazon, Google or Play Store search, a Maps "
+                  "place or directions, a Play Store app page, a WhatsApp chat by number, the Gmail inbox, a Calendar "
+                  "day), prefer open_link: one step, no tapping through. If it errors, lands in the browser or on the "
+                  "wrong screen, navigate in the app instead. For an app that isn't listed, open_url with the app's "
+                  "own web link (its search page, say) often opens in the app too.\n")
+MULTI_CALL_RULE = (
+    "Usually make one tool call per turn and check the next screenshot. When you can predict the screen after "
+    "each action, you may make up to {n} calls in one turn (for example: tap a chess piece, then its target "
+    "square; type text, then press Enter). They run in order on the screen you see now. If one fails, asks the "
+    "user, or the screen changes unexpectedly, the rest are skipped and you see the new screen. Never combine "
+    "done with other actions: call done alone, after you've seen the result."
+)
+
+
+FORM_CALL_RULE = (
+    "Make exactly ONE tool call per turn, then check the next screenshot to confirm it worked before moving on. "
+    "On a form (a screen with two or more text fields and no password field), you may make up to {n} calls in one "
+    "turn to fill it (for example: tap a field, type its value, tap the next field, type its value). Only taps on "
+    "text fields and typing without submit share a turn: tap Save, Send or any other button, or press Enter, in a "
+    "turn of its own, after you've seen what you typed. They run in order on the screen you see now. If one fails, asks the user, or the screen changes unexpectedly, the rest are "
+    "skipped and you see the new screen. Never combine done with other actions: call done alone, after you've seen "
+    "the result."
+)
+
+
+def system_prompt(platform: str = "android", max_actions: int = 1, settings_pages: bool = False,
+                  app_links: bool = False, form_actions: int = 1) -> str:
+    """The agent's instructions, with notes for the phone's platform and how many actions a turn may take.
+    `settings_pages`: the phone can open Settings pages directly, so say to prefer open_settings_page.
+    `app_links`: the open_link catalog is offered, so say to prefer it over tapping through an app.
+    `form_actions`: with one action a turn elsewhere, how many a form may take (fast.is_form)."""
+    prompt = SYSTEM_PROMPT
+    if max_actions > 1:
+        prompt = prompt.replace(ONE_CALL_RULE, MULTI_CALL_RULE.format(n=max_actions))
+    elif form_actions > 1:
+        prompt = prompt.replace(ONE_CALL_RULE, FORM_CALL_RULE.format(n=form_actions))
+    extra = (APP_LINKS_LINE if app_links else "") + (SETTINGS_PAGE_LINE if settings_pages else "")
+    if extra:
+        prompt = prompt.replace(OPEN_URL_LINE, OPEN_URL_LINE + extra)
+    if platform == "ios":  # the indicator is drawn by OpenMob's Android app only
+        prompt = prompt.replace(INDICATOR_LINE, "")
+        return (
+            prompt.replace("the user's Android phone", "the user's iPhone")
+            .replace("It can be any Android phone and any app", "It can be any app")
+            + IOS_NOTES
+        )
+    return prompt
+
+
+# Plan first (permission mode "plan"): offered only in that mode, so other tasks' tool lists don't change.
+PLAN_TOOL = {
+    "name": "propose_plan",
+    "description": (
+        "Show the owner a short numbered plan for this request and wait for their one approval. Required "
+        "before any other action in this task. Name each risky step's action in its words (\"Send the message "
+        "to Mom in WhatsApp\") and the app it happens in."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "array", "minItems": 1, "maxItems": 12,
+                "items": {"type": "object", "properties": {
+                    "text": {"type": "string", "description": "One step, in plain words"},
+                    "app": {"type": "string", "description": "The app it happens in, if any"},
+                }, "required": ["text"]},
+            },
+        },
+        "required": ["steps"],
+    },
+}
+PLAN_TOOL_SPEC = {"name": PLAN_TOOL["name"], "description": PLAN_TOOL["description"],
+                  "parameters": PLAN_TOOL["input_schema"]}
+
+# Plan with the model, execute with the classifier (config.plan_execute): offered only then (agent/plan.py).
+PLAN_STEPS_TOOL = {
+    "name": "plan_steps",
+    "description": (
+        "Lay out a request that opens or shows things as 1-8 sub-goals for a quick helper that works from the "
+        "element list without you. Each has a goal (one short imperative: 'Open the Apps list') and a cue: a label "
+        "that is on screen only once that sub-goal is reached (the destination's title, or something on that page: "
+        "'Brightness level'), never the item tapped to get there. The helper taps, scrolls, presses Back and opens "
+        "apps toward each sub-goal, and comes back to you with the plan and progress when a screen doesn't fit. "
+        "Typing, links and anything risky stay yours. Call it once, as your first action; call it again to re-plan."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "steps": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "items": {"type": "object", "properties": {
+                    "goal": {"type": "string", "description": "One sub-goal, in plain words"},
+                    "cue": {"type": "string", "description": "A label visible once it's reached"},
+                }, "required": ["goal", "cue"]},
+            },
+        },
+        "required": ["steps"],
+    },
+}
+PLAN_STEPS_TOOL_SPEC = {"name": PLAN_STEPS_TOOL["name"], "description": PLAN_STEPS_TOOL["description"],
+                        "parameters": PLAN_STEPS_TOOL["input_schema"]}
+# The dedicated planning request on a cold run (loop.Agent._plan_request): plan_steps is its only tool.
+PLAN_REQUEST_PROMPT = (
+    "You are OpenMob, an agent that operates the user's Android phone. Before acting on the request, lay out its "
+    "navigation as sub-goals for a quick helper that works from the element list without you: call plan_steps with "
+    "1-8 steps, each a goal (one short imperative: 'Open the Apps list') and a cue, a label that is on screen only "
+    "once that sub-goal is reached (the destination's title, or something on that page), never the item tapped to "
+    "get there. You see the current screen; the first sub-goal starts from it. Leave out typing, links and anything "
+    "that spends, sends or deletes: the helper hands those to you. If there is no navigation to plan, say so in one "
+    "short sentence."
+)
+PLAN_STEPS_NOTE = (
+    "\nA quick helper can do the navigation for you: for a request that only opens or shows things in an app with "
+    "a readable element list, call plan_steps first (sub-goals with a cue each). You'll be asked again only when a "
+    "screen doesn't fit the plan, with the plan and the progress so far.\n"
+)
+
+MODE_NOTES = {
+    "ask": "\nPermission mode: Ask every step. The owner approves each change on their phone, so don't also "
+           "call ask_user to confirm; ask only when the request is ambiguous.\n",
+    "plan": "\nPermission mode: Plan first. Before anything else, call propose_plan with a short numbered plan. "
+            "After the owner approves it, follow it; a risky step the plan doesn't name, or any payment, still "
+            "asks. If the owner asks for changes, propose a revised plan.\n",
+    "auto": "",  # today's behavior: the base prompt's safety rules
+    "trusted": "",
+    "never": "\nPermission mode: Don't ask. The owner chose not to be asked: don't call ask_user to confirm. "
+             "Payments, autofill and blocked apps are refused; if one is needed, call done and say so.\n",
+}
+
+
+RISK_NOTE = ("\nLow-risk actions (sharing a link with yourself, copying, liking, subscribing, saving, menus) run "
+             "without asking; the phone decides what needs the owner's confirmation. Don't ask the owner to confirm "
+             "them yourself.\n")
+
+
+def mode_notes(mode: str) -> str:
+    return MODE_NOTES.get(mode, "") + (RISK_NOTE if mode in ("auto", "trusted", "plan") else "")

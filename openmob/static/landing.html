@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>OpenMob: give any AI agent a real Android phone</title>
+<meta name="description" content="One MCP server and REST API between your agent and a real Android phone. The phone judges every tap itself.">
+<!-- Served by server.py's landing_page: the server's address and the invite link are filled in, HTML-escaped,
+     and each if/end block is kept or dropped. No inline script or style: the page runs under a strict CSP. -->
+<script src="/static/landing.js"></script>
+<link rel="stylesheet" href="/static/ds.css">
+<link rel="stylesheet" href="/static/landing.css">
+</head>
+<body class="lp">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-row">
+    <a class="wordmark" href="/" aria-label="OpenMob home">OpenMob</a>
+    <nav class="header-nav" aria-label="Main">
+      <a href="#developers">Developers</a>
+      <a href="#security">Security</a>
+      <a href="#how">How it works</a>
+      <a href="/developer#/docs/quickstart">Docs</a>
+    </nav>
+    <div class="header-actions">
+      <a class="btn-lp btn-outline btn-small" href="/login">Log in</a>
+      <!--if invite--><a class="btn-lp btn-accent btn-small" href="{{invite_href}}">Request an invite</a><!--end invite-->
+    </div>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+
+<section class="wrap hero" aria-labelledby="hero-title">
+  <div class="hero-copy">
+    <p class="kicker">Invite-only beta · Android 11 and newer</p>
+    <h1 id="hero-title">Give any AI agent a real Android phone.</h1>
+    <p class="lede">One MCP server and REST API between your agent and a real phone. The phone judges every tap
+      itself, so your agent can act without being handed the keys.</p>
+    <div class="actions">
+      <!--if invite--><a class="btn-lp btn-accent" href="{{invite_href}}">Request an invite</a><!--end invite-->
+      <!--if no-invite--><a class="btn-lp btn-accent" href="/login">I have an invite</a><!--end no-invite-->
+      <a class="btn-lp btn-outline" href="#developers">Connect over MCP</a>
+    </div>
+  </div>
+
+  <figure class="console" aria-labelledby="console-caption">
+    <div class="console-bar" aria-hidden="true"><span>run_task</span><span>example</span></div>
+    <div class="console-body">
+      <p class="console-who">agent →</p>
+      <p class="console-ask">“Reorder my usual coffee beans and pay with the saved card.”</p>
+      <p class="console-who">your phone →</p>
+      <dl class="verdicts">
+        <div><dt class="v-ok">ALLOWED</dt><dd>open Shop · search “house blend”</dd></div>
+        <div><dt class="v-ok">ALLOWED</dt><dd>tap “Add to cart”</dd></div>
+        <div><dt class="v-ask">ASKED YOU</dt><dd>use the saved card → approve with your fingerprint or PIN</dd></div>
+        <div><dt class="v-ask">ASKED YOU</dt><dd>tap “Place order · $18.40” → approve on the phone</dd></div>
+        <div><dt class="v-no">BLOCKED</dt><dd>open Banking: banking apps are off-limits</dd></div>
+      </dl>
+    </div>
+    <figcaption id="console-caption" class="console-foot">Illustrative task. Each verdict is the phone’s own.</figcaption>
+  </figure>
+</section>
+
+<section class="strip" aria-label="At a glance">
+  <div class="wrap strip-row">
+    <div><p class="strip-big">Every tap</p><p class="strip-small">judged on the phone itself</p></div>
+    <div><p class="strip-big">Your model</p><p class="strip-small">pick the AI model for each task</p></div>
+  </div>
+</section>
+
+<section id="developers" class="wrap section" aria-labelledby="dev-title">
+  <p class="eyebrow">For developers</p>
+  <h2 id="dev-title">Three ways in. One safety model.</h2>
+  <p class="intro">Whichever way your agent connects, the same phone-side checks apply. Your key can tighten them,
+    never loosen them past what the phone’s owner allows.</p>
+  <div class="cards">
+    <article class="card">
+      <h3>MCP server</h3>
+      <p>Works with any MCP client or your own agent. Start a task, watch the screen, answer questions, stop.</p>
+      <pre class="code" tabindex="0" aria-label="MCP client configuration"><code>"openmob": {
+  "url": "{{base}}/mcp",
+  "headers": {"Authorization": "Bearer &lt;your API key&gt;"}
+}</code></pre>
+    </article>
+    <article class="card">
+      <h3>REST API and webhooks</h3>
+      <p>Start tasks, stream events, answer questions. Scoped API keys and signed webhooks.</p>
+      <pre class="code" tabindex="0" aria-label="Start a task with curl"><code>curl -X POST {{base}}/v1/devices/$DEVICE_ID/tasks \
+  -H "Authorization: Bearer $OPENMOB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"instruction": "open YouTube and search for lo-fi"}'</code></pre>
+    </article>
+    <article class="card">
+      <h3>On the phone itself</h3>
+      <p>No code: chat with your agent in the OpenMob app, pick a model, and watch it work. A live view and Stop
+        are always one tap away on the dashboard.</p>
+      <div class="shot">
+        <img class="shot-light" src="/static/img/app-home-light.webp" width="520" height="657" loading="lazy"
+             alt="The OpenMob app's Home screen: a chat with the agent, one task stopped by the owner and one done.">
+        <img class="shot-dark" src="/static/img/app-home-dark.webp" width="520" height="657" loading="lazy"
+             alt="The OpenMob app's Home screen: a chat with the agent, one task stopped by the owner and one done.">
+      </div>
+    </article>
+  </div>
+</section>
+
+<section id="security" class="security" aria-labelledby="sec-title">
+  <div class="wrap section">
+    <p class="eyebrow">Security</p>
+    <h2 id="sec-title">The server could be compromised. The phone is built as if it were.</h2>
+    <p class="intro">Most agent tools trust whoever sends the command. OpenMob puts the final decision on your
+      phone, with its own rules and its own keys, so a hacked server or a prompt-injected agent can at most
+      <em>ask</em>: risky steps still wait for you, and blocked ones are refused.</p>
+
+    <ol class="path" aria-label="How a command travels">
+      <li>Your agent</li>
+      <li>OpenMob server <span>(not trusted by the phone)</span></li>
+      <li class="path-phone">Your phone decides</li>
+      <li>Your apps</li>
+    </ol>
+
+    <div class="points">
+      <div><h3>Judged on the phone</h3><p>Every action is checked on the device before it happens. Payments always
+        ask you first; sends, posts, deletes and installs ask too, unless they’re what you asked for.</p></div>
+      <div><h3>Keys that stay put</h3><p>The keys that identify your phone and sign your approvals are sealed on the
+        phone. They’re never backed up or moved to a new phone: a new phone pairs again.</p></div>
+      <div><h3>Approvals happen on the phone</h3><p>Purchases and other high-risk steps take your PIN, pattern or
+        fingerprint. Approval notifications never show what’s being asked: you see it in the app.</p></div>
+      <div><h3>Off-limits by default</h3><p>Banking, payment, wallet and password apps are off-limits. OpenMob never
+        types into a password field and never unlocks your phone.</p></div>
+      <div><h3>Kept out of the record</h3><p>Card numbers and Social Security numbers are hidden in the activity
+        feed, history, API events and webhooks, and typing one always asks you. Screenshots are never stored.</p></div>
+      <div><h3>Stop means stop</h3><p>Stop from the dashboard, the API or the phone and the task stops right away.
+        Disconnect on the phone and agents can’t reach it.</p></div>
+    </div>
+
+    <div class="security-foot">
+      <a class="text-link" href="/safety">Read the safety details <span aria-hidden="true">→</span></a>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="wrap section" aria-labelledby="how-title">
+  <p class="eyebrow">How it works</p>
+  <h2 id="how-title">Paired in a minute. In control the whole time.</h2>
+  <ol class="steps">
+    <li><span class="step-n" aria-hidden="true">01</span><h3>Pair your phone</h3><p>Install the app, then scan a QR
+      code or type a short code. You confirm on the phone with your screen lock.</p></li>
+    <li><span class="step-n" aria-hidden="true">02</span><h3>Connect your agent</h3><p>Make a scoped API key and add
+      OpenMob to your MCP client, call the REST API, or just type in the app.</p></li>
+    <li><span class="step-n" aria-hidden="true">03</span><h3>Watch, approve, stop</h3><p>Follow every step in a live
+      view. Approve risky ones on the phone. Stop any time.</p></li>
+  </ol>
+</section>
+
+<section class="data" aria-labelledby="data-title">
+  <div class="wrap data-row">
+    <h2 id="data-title">Who sees your screen</h2>
+    <p>To decide each step, what’s on screen is sent to the AI provider that runs your chosen model and, when the
+      server uses one, as text to a screen-classification service. With Faster mode on (it’s off by default, and only you can turn it
+      on, from the phone), small screenshots of screens without readable text, such as games, go to that service
+      too. OpenMob never stores
+      screenshots.<!--if privacy--> Our <a href="/privacy">privacy policy</a> names our providers.<!--end privacy--></p>
+  </div>
+</section>
+
+<section id="invite" class="wrap section invite" aria-labelledby="invite-title">
+  <div class="invite-copy">
+    <h2 id="invite-title">Invite-only, for now.</h2>
+    <p>We’re opening OpenMob to a small group first. Have an invite link? Open it, or log in and choose “Have an
+      invite code?”.<!--if no-invite--> To get one, ask whoever runs this OpenMob server.<!--end no-invite--></p>
+    <!--if operator--><p class="operator">Running this server? Make an invite with
+      <code>openmob account invite</code>.</p><!--end operator-->
+  </div>
+  <div class="actions">
+    <!--if invite--><a class="btn-lp btn-accent" href="{{invite_href}}">Request an invite</a><!--end invite-->
+    <a class="btn-lp btn-outline" href="/login">I have an invite</a>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-row">
+    <span class="wordmark wordmark-small">OpenMob</span>
+    <nav class="footer-nav" aria-label="Footer">
+      <a href="/developer#/docs/quickstart">Docs</a>
+      <a href="/safety">Safety</a>
+      <!--if privacy--><a href="/privacy">Privacy</a><!--end privacy-->
+      <!--if terms--><a href="/terms">Terms</a><!--end terms-->
+    </nav>
+    <span class="footer-note">Android 11 and newer · invite-only beta</span>
+  </div>
+</footer>
+</body>
+</html>

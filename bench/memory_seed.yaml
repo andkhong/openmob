@@ -1,0 +1,14 @@
+# Notes for `openmob bench --memory-account <id>` and bench/memory_overhead.py (docs/benchmarks.md, "Memory overhead").
+# One about-you note, one note for the Clock app (the stopwatch task reaches the Clock through vision steps; Settings
+# notes don't reach the model on direct deep-link steps), one person note, and `filler` extra about-you notes so the
+# store has a realistic size. All are written active.
+about_you:
+  - I prefer dark mode and large text
+app:
+  - package: com.google.android.deskclock
+    text: In Clock the Stopwatch is the second tab along the bottom
+people:
+  - relation: sis
+    contact_name: Maya Lee
+    text: she likes voice notes
+filler: 15

@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Smooth live view on the web dashboard: screen streaming, approved by the owner per connection. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- The approval screen hides other apps' overlays while the owner answers (normal permission, API 31+). -->
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
+    <!-- Setup checklist: ask to be exempt from battery optimization, so the connection survives screen-off. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Pairing must be approved with the phone's screen lock (BiometricPrompt). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- In-app updates (review 5 P5-L3): OpenMob hands Android's installer an update it downloaded from its paired
+         server and checked (this package, this app's signer, a higher version). Nothing else is ever installed. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- The agent opens any app the user names, so it must see every installed app. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
+    <!-- Nothing is backed up or copied to a new phone (review 4, L7): the device key, pairing and history stay here.
+         dataExtractionRules: Android 12+ (cloud backup and device-to-device transfer); fullBackupContent: Android 11. -->
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight"
+        android:usesCleartextTraffic="${usesCleartext}">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.OpenMob.Redesign"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+            <!-- Pairing link (e.g. from a QR code): openmob://connect?server=https://…&code=<one-time code>,
+                 or legacy token mode: openmob://connect?server=https://…&t=<token> -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="openmob" android:host="connect" />
+            </intent-filter>
+        </activity>
+
+        <!-- The shortcuts', the tile's and OpenMob's own notifications' way in (security review 4, L6): not exported, so
+             only OpenMob and the launcher's shortcuts (started as OpenMob) reach it. MainActivity runs a shortcut
+             action (Connect, Ask, …) only when it came through here; from another app it just opens the app. -->
+        <activity-alias
+            android:name=".ShortcutEntry"
+            android:exported="false"
+            android:targetActivity=".MainActivity" />
+
+        <!-- Approve a risky action with the screen lock; opened from the approval notification. -->
+        <activity
+            android:name=".ApprovalActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="" />
+
+        <!-- The checked update APK, shared read-only with Android's installer (AppUpdates.openDownload). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
+
+        <!-- "Paired with … · Undo" after an account pairing (PairingFlow.notifyPaired). -->
+        <receiver
+            android:name=".PairUndoReceiver"
+            android:exported="false" />
+
+        <!-- The approval notification's Deny button. -->
+        <receiver
+            android:name=".ApprovalReceiver"
+            android:exported="false" />
+
+        <service
+            android:name=".ConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|mediaProjection">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the connection to the user's OpenMob agent server while the agent operates the phone." />
+        </service>
+
+        <!-- Quick Settings tile: pull down the notification panel → OpenMob. -->
+        <service
+            android:name=".OpenMobTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_openmob_tile"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
+            android:name=".OpenMobAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+    </application>
+</manifest>

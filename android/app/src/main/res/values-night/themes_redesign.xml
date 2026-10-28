@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.OpenMob.Redesign" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/rd_ground</item>
+    </style>
+    <color name="rd_ground">#0B0F15</color>
+    <color name="rd_signal">#5A7CFF</color>
+</resources>

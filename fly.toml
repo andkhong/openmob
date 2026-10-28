@@ -1,0 +1,38 @@
+app = "openmob"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[build.args]
+  # The hosted server's release key (its certificate SHA-256): the image build and the server refuse a download
+  # signed by any other key (openmob/apk_check.py; docs/release-signing.md). `om release` checks against it too.
+  OPENMOB_RELEASE_SIGNERS = "8b6dcac4692c34cd101a72c7afd30555980ba43867403470804182f089c6d3b8"
+
+[env]
+  # This server's own address: the agent never opens it on a phone (review 5 H1; openmob/own_hosts.py).
+  OPENMOB_PUBLIC_URL = "https://openmob.fly.dev"
+  OPENMOB_INVITE_EMAIL = "yojimboai@gmail.com"   # the landing page's "Request an invite" mailto
+
+[mounts]
+  source = "openmob_data"
+  destination = "/data"   # accounts, phone registrations, app-name caches
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Phones hold a live WebSocket to this machine, and sessions live in memory: never auto-stop.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "40s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/auth/me"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"   # Agent and connected phone sessions

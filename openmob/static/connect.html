@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect a Phone · OpenMob</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:wght@600&display=swap" rel="stylesheet">
+<script>try { const t = localStorage.getItem("openmob.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" integrity="sha512-CNgIRecGo7nphbeZ04Sc13ka07paqdeTu0WR1IM4kNcpmBAUSHSQX0FslNhTDadL4O5SAGapGt4FodqL8My0mA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<link rel="stylesheet" href="/static/ds.css">
+<style>
+  /* ---------- connect ---------- */
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .qr { background: #fff; padding: 14px; border-radius: var(--r); display: flex; justify-content: center; border: 1px solid var(--line); transition: opacity .2s, filter .2s; }
+  .qr img, .qr canvas { width: 100% !important; max-width: 280px; height: auto !important; }
+  .qr.expired { opacity: .15; filter: blur(3px); }
+  .scan { text-align: center; color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .scan.expiry { font-variant-numeric: tabular-nums; }
+  ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; counter-reset: step; }
+  ol.steps li { display: grid; grid-template-columns: 30px 1fr; gap: 12px; counter-increment: step; }
+  ol.steps li::before { content: counter(step); width: 28px; height: 28px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: center; }
+  ol.steps li b { display: block; }
+  ol.steps li span { color: var(--muted); font-size: 14px; }
+  .callout { margin-top: 14px; }
+  .note { margin-top: 16px; font-size: 13px; color: var(--muted); }
+  .note code { background: var(--code); padding: 2px 6px; border-radius: 6px; overflow-wrap: anywhere; font-size: 12px; }
+  .devices { list-style: none; margin: 0; padding: 0; }
+  .devices li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .devices li:last-child { border-bottom: 0; }
+  .devices li .name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+  .devices li.empty { color: var(--muted); font-size: 14px; display: flex; gap: 10px; }
+  .devices li.empty::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); animation: om-pulse 1.4s ease-in-out infinite; flex: none; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.on { background: var(--ok); }
+  .devices small { color: var(--muted); }
+  .devices li.fresh .name::after { content: "New phone added"; margin-left: 8px; font-size: 12px; font-weight: 600; color: var(--ok); background: var(--ok-soft); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .stack { display: grid; gap: 20px; }
+  /* ---------- typed code (the fallback to the QR code) ---------- */
+  .typed { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); text-align: center; }
+  .typed-label { color: var(--muted); font-size: 13px; }
+  .typed-code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 34px; font-weight: 500; letter-spacing: .14em; margin: 8px 0 2px; font-variant-numeric: tabular-nums; user-select: all; }
+  .typed-code.expired { opacity: .25; text-decoration: line-through; }
+  .typed-server { color: var(--muted); font-size: 13px; margin-top: 4px; overflow-wrap: anywhere; }
+  .typed-status { font-size: 14px; margin-top: 10px; }
+  .typed-status b { overflow-wrap: anywhere; }
+  .typed-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/" id="brandLink"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="6.5" y="2.5" width="11" height="19" rx="3"/><path d="M10.5 18h3"/></svg></span>OpenMob<span class="page-name">Connect a phone</span></a>
+  <nav class="topnav"><a class="btn btn-ghost" id="back" href="/">← Dashboard</a></nav>
+</header>
+<main class="page">
+  <div class="grid">
+    <div class="card">
+      <div class="qr" id="qr" role="img" aria-label="Pairing QR code"></div>
+      <div class="scan">Scan with the phone's camera</div>
+      <div class="scan" id="serverLine" hidden>The phone connects to <b id="serverName"></b>. Keep it on the same network as this computer.</div>
+      <div class="scan expiry" id="expiry" hidden aria-live="polite"></div>
+      <div style="text-align:center; margin-top:10px"><a class="btn btn-sm" id="newCode" href="#" hidden>Make a new code</a></div>
+      <div class="typed" id="typedBox" hidden>
+        <button class="btn btn-sm btn-ghost" type="button" id="typedShow">Can't scan? Show a code to type</button>
+        <div id="typedPanel" hidden>
+          <div class="typed-label">Type this on the phone: Pairing › Type a code instead</div>
+          <div class="typed-code" id="typedCode" aria-live="polite"></div>
+          <div class="scan expiry" id="typedExpiry" aria-live="polite"></div>
+          <div class="typed-server" id="typedServer" hidden></div>
+          <div class="typed-status" id="typedStatus" aria-live="polite"></div>
+          <div class="typed-actions">
+            <button class="btn btn-sm btn-danger" type="button" id="typedCancel" hidden>Not my phone: cancel the code</button>
+            <button class="btn btn-sm btn-danger" type="button" id="typedUndo" hidden>Undo: remove this phone</button>
+            <button class="btn btn-sm" type="button" id="typedNew" hidden>Make a new code</button>
+          </div>
+        </div>
+      </div>
+      <div class="callout warn" id="localWarn" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9.5 17h-19zM12 10v4M12 17.5v.01"/></svg>
+        <div>You're on a localhost address, which phones can't reach. Open this page with your computer's network address instead (the one <code>openmob run</code> prints under "On your network"), or start the server with <code>openmob run --public</code> and open the public link.</div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <div class="page-head" style="margin-bottom:18px">
+          <h1>Connect a phone</h1>
+          <p>Any Android phone (Android 11+) can join. No cable, no developer mode.</p>
+        </div>
+        <ol class="steps">
+          <li><div><b>Scan the QR code</b><span>With the phone's camera. It opens a page on the phone.</span></div></li>
+          <li><div><b>Install the OpenMob app</b><span id="apkLine">First time only: download it from that page and allow the install.</span></div></li>
+          <li><div><b>Tap Open OpenMob, then confirm</b><span id="confirmLine">The phone asks once, with its fingerprint or PIN. No sign-in on the phone.</span></div></li>
+          <li><div><b>Follow the app's checklist</b><span>Turn on OpenMob in Accessibility, allow notifications and background use. Disconnect any time from the notification.</span></div></li>
+        </ol>
+        <div class="note">Can't scan? On the phone, open <code id="pairUrl">…</code></div>
+        <div class="note" id="usbNote" hidden>Developer with a USB cable? <code>openmob phone add --server <span id="usbServer"></span></code> installs, sets up and pairs the phone in one go (see Phone setup in the docs).</div>
+        <div class="callout warn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6z"/></svg>
+          <div id="codeWarn">This code works like a password: anyone who scans it can connect a phone to this agent. Only show it to people you trust.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Your phones</h2></div>
+        <ul class="devices" id="devices" aria-live="polite"><li class="empty">Waiting for a phone to connect…</li></ul>
+        <a class="btn btn-primary" id="open" href="/" hidden style="margin-top:12px">Open dashboard</a>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+const token = new URLSearchParams(location.search).get("t") || "";
+const $ = (id) => document.getElementById(id);
+$("back").href = $("open").href = $("brandLink").href = `/?t=${encodeURIComponent(token)}`;
+let accounts = false;
+let expiresAt = 0;
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { "X-OpenMob-Token": token, ...(opts.headers || {}) } });
+  if (res.status === 401 && accounts) location.href = "/login?next=" + encodeURIComponent(location.pathname);
+  if (!res.ok) throw new Error(res.status === 401 ? "Bad token: open this page from the link printed by `openmob run`." : res.statusText);
+  return res.json();
+}
+
+async function checkAccount() {
+  try {
+    const me = await (await fetch("/api/auth/me")).json();
+    accounts = !!me.accounts;
+    if (accounts && !me.email) {
+      location.href = "/login?next=" + encodeURIComponent(location.pathname);
+      return false;
+    }
+    if (accounts) {
+      $("back").href = $("open").href = $("brandLink").href = "/";
+      $("codeWarn").textContent = `This code works once, for 2 minutes, and pairs a phone to ${me.email}. ` +
+        "The phone names this server and your email and asks for its screen lock first. Every new phone shows up " +
+        "below and on your dashboard, where you can remove it.";
+      $("usbNote").hidden = false;
+    }
+  } catch {}
+  return true;
+}
+
+async function init() {
+  try {
+    const p = await api("/api/pairing", { method: "POST" });  // in account mode this issues a fresh one-time code
+    $("pairUrl").textContent = p.pair_url;
+    $("usbServer").textContent = location.origin;
+    $("localWarn").hidden = !p.local;
+    const host = (() => { try { return new URL(p.server).host; } catch { return ""; } })();
+    if (p.email) $("confirmLine").textContent = `The phone asks once, with its fingerprint or PIN: "Connect this phone to ${host} as ${p.email}?" No sign-in on the phone.`;
+    $("serverName").textContent = host;
+    $("serverLine").hidden = !host || p.local || p.server.startsWith("https://");  // only for local-network servers
+    $("apkLine").textContent = p.apk_url ? "First time only: download it from that page and allow the install." : "The app isn't built on this server yet (cd android && ./gradlew assembleDebug).";
+    $("qr").replaceChildren();
+    $("qr").classList.remove("expired");
+    if (window.QRCode) new QRCode($("qr"), { text: p.pair_url, width: 560, height: 560, correctLevel: QRCode.CorrectLevel.M });
+    else $("qr").textContent = p.pair_url;
+    expiresAt = p.accounts ? p.expires * 1000 : 0;
+    $("newCode").hidden = !p.accounts;
+    tick();
+  } catch (e) { $("qr").textContent = e.message; }
+}
+
+function tick() {
+  if (!expiresAt) return;
+  const left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+  $("expiry").hidden = false;
+  $("expiry").textContent = left
+    ? `Code expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`
+    : "This code expired. Make a new one.";
+  $("qr").classList.toggle("expired", !left);
+}
+setInterval(tick, 1000);
+$("newCode").onclick = (e) => { e.preventDefault(); init(); };
+
+const openedAt = Date.now() / 1000;
+
+async function revoke(device) {  // one click: removing is safe, pairing again takes a scan
+  try { await api(`/api/devices/${encodeURIComponent(device.id)}/revoke`, { method: "POST" }); } catch (e) { alert(e.message); }
+  poll(false);
+}
+
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - (t || 0));
+  return !t ? "never" : s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : new Date(t * 1000).toLocaleDateString();
+}
+
+async function poll(again = true) {
+  try {
+    const devices = (await api("/api/devices")).filter((d) => d.connection === "app");
+    $("devices").replaceChildren(...(devices.length ? devices.map((d) => {
+      const li = document.createElement("li");
+      if (d.paired_at && d.paired_at >= openedAt - 5) {  // paired from this page: the code was used
+        li.className = "fresh";
+        // A phone paired with the typed code didn't use the QR code: that one stays live.
+        if (expiresAt && d.paired_via !== "typed") { expiresAt = 0; $("expiry").textContent = "Code used. Make a new one to add another phone."; $("qr").classList.add("expired"); }
+      }
+      const dot = Object.assign(document.createElement("span"), { className: `dot ${d.online ? "on" : ""}` });
+      const name = Object.assign(document.createElement("span"), { className: "name", textContent: d.name || d.model });
+      const state = Object.assign(document.createElement("small"), { textContent: d.online ? "connected" : d.paired ? `offline · last seen ${ago(d.last_seen)}` : "offline" });
+      li.append(dot, name, state);
+      if (accounts) {
+        const btn = Object.assign(document.createElement("button"), { className: "btn btn-sm btn-danger", type: "button", textContent: "Remove" });
+        btn.setAttribute("aria-label", `Remove ${d.model} from your account`);
+        btn.onclick = () => revoke(d);
+        li.append(btn);
+      }
+      return li;
+    }) : [Object.assign(document.createElement("li"), { className: "empty", textContent: "Waiting for a phone to connect…" })]));
+    $("open").hidden = !devices.some((d) => d.online);
+  } catch (e) { /* keep last list */ }
+  if (again) setTimeout(poll, 2000);
+}
+
+// --- typed code: made only when asked for, shown once, never kept in this page's storage ---------
+const HOSTED = "openmob.fly.dev";
+let typed = null;  // {expiresAt, deviceId}
+let typedTimer = 0;
+
+async function typedApi(method) {
+  const res = await fetch("/api/pairing/code", { method });
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 401) location.href = "/login?next=" + encodeURIComponent(location.pathname);
+  if (!res.ok) throw new Error(body.detail || res.statusText);
+  return body;
+}
+
+function typedStatus(text, strong) {
+  const line = $("typedStatus");
+  line.replaceChildren(text);
+  if (strong) line.append(Object.assign(document.createElement("b"), { textContent: strong }));
+}
+
+async function showTyped() {
+  $("typedShow").hidden = true;
+  $("typedPanel").hidden = false;
+  for (const id of ["typedCancel", "typedUndo", "typedNew"]) $(id).hidden = true;
+  $("typedCode").classList.remove("expired");
+  try {
+    const p = await typedApi("POST");
+    $("typedCode").textContent = p.code;
+    const host = (() => { try { return new URL(p.server).host; } catch { return ""; } })();
+    $("typedServer").hidden = !host || host === HOSTED;
+    $("typedServer").textContent = `Your own server: on the phone, tap More options › Your own server and enter ${p.server}`;
+    typed = { expiresAt: p.expires * 1000, deviceId: null };
+    typedStatus(`Works once, for 5 minutes, for ${p.email}. Waiting for the phone…`);
+    clearTimeout(typedTimer);
+    typedTick();
+  } catch (e) {
+    $("typedCode").textContent = "";
+    typedStatus(e.message);
+    $("typedNew").hidden = false;
+  }
+}
+
+function typedEnd(message, strong) {
+  typed = null;
+  clearTimeout(typedTimer);
+  $("typedCode").classList.add("expired");
+  $("typedExpiry").textContent = "";
+  $("typedCancel").hidden = true;
+  $("typedNew").hidden = false;
+  typedStatus(message, strong);
+}
+
+async function typedTick() {
+  if (!typed) return;
+  const left = Math.max(0, Math.round((typed.expiresAt - Date.now()) / 1000));
+  $("typedExpiry").textContent = left ? `Code expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}` : "";
+  let s;
+  try { s = await typedApi("GET"); } catch { typedTimer = setTimeout(typedTick, 2000); return; }
+  if (!typed) return;
+  if (s.status === "paired") {
+    typed.deviceId = s.device_id;
+    const id = s.device_id;
+    typedEnd("Paired: ", s.model || "a phone");
+    $("typedStatus").append(". Not yours? Undo removes it right away.");
+    $("typedUndo").hidden = false;
+    $("typedUndo").onclick = async () => {
+      $("typedUndo").disabled = true;
+      try { await api(`/api/devices/${encodeURIComponent(id)}/revoke`, { method: "POST" }); typedStatus("Removed. That phone can no longer connect."); $("typedUndo").hidden = true; }
+      catch (e) { typedStatus(e.message); }
+      $("typedUndo").disabled = false;
+      poll(false);
+    };
+    poll(false);
+    return;
+  }
+  if (s.status === "confirming") {
+    typedStatus("A phone entered the code and is confirming: ", s.model || "unknown phone");
+    $("typedStatus").append(". Is that your phone?");
+    $("typedCancel").hidden = false;
+  } else if (s.status === "waiting" && s.tries_left < 5) {
+    typedStatus(`Waiting for the phone… ${5 - s.tries_left} wrong ${s.tries_left === 4 ? "try" : "tries"} so far, ${s.tries_left} left.`);
+  }
+  if (s.status === "expired" || !left) return typedEnd("This code expired. Make a new one.");
+  if (s.status === "cancelled") return typedEnd("This code was cancelled (too many wrong tries, a second phone, or you). Make a new one.");
+  if (s.status === "none") return typedEnd("This code was replaced. Make a new one.");
+  typedTimer = setTimeout(typedTick, 1000);
+}
+
+$("typedShow").onclick = showTyped;
+$("typedNew").onclick = showTyped;
+$("typedCancel").onclick = async () => {
+  try { await typedApi("DELETE"); } catch {}
+  typedEnd("Code cancelled. That phone can't use it. Make a new one when your phone is ready.");
+};
+
+checkAccount().then((ok) => { if (ok) { init(); poll(); $("typedBox").hidden = !accounts; } });
+</script>
+</body>
+</html>

@@ -1,0 +1,207 @@
+# Copy to config.yaml (or ~/.config/openmob/config.yaml) and edit.
+# Secrets come from the environment, never this file: ANTHROPIC_API_KEY, OPENAI_API_KEY,
+# GEMINI_API_KEY (or GOOGLE_API_KEY), QWEN_API_KEY (or DASHSCOPE_API_KEY), XAI_API_KEY,
+# OPENAI_COMPATIBLE_API_KEY, and optionally TYPESAFE_API_KEY for Jev.
+# A model whose provider has no key is listed in the dashboard but can't be picked.
+
+# Model that looks at the screen and decides each action (any provider below).
+model: claude-sonnet-5-5          # claude-opus-5-5 is smarter but slower
+resolver_model: claude-haiku-5-5
+# Models the dashboard's "Model" dropdown offers per phone (an allowlist). The default above is always included.
+# Without a models override: Claude, GPT-6.1 Sol, GPT-6 Astra, GPT-6 Luna, Gemini 3.8 Flash,
+# Qwen 3.8 Flash, and Grok 4.7 are listed.
+# provider: anthropic | openai | google | qwen | xai | openai_compatible (inferred for known model names).
+# OpenAI, Qwen, Grok and compatible endpoints use pip install -e '.[openai]'; Gemini uses '.[gemini]'.
+# models:
+#   - {id: claude-sonnet-5-5, label: "Sonnet 5.5 (balanced, recommended)", provider: anthropic}
+#   - {id: claude-opus-5-5, label: "Opus 5.5 (smartest, slower, pricier)", provider: anthropic}
+#   - {id: claude-haiku-5-5, label: "Haiku 5.5 (fastest, cheapest)", provider: anthropic,
+#      effort: high, max_tokens: 8192, vision_max_tokens: 8192}
+#   - {id: gpt-6.1-sol, label: "GPT-6.1 Sol", provider: openai,
+#      reasoning_effort: low, max_tokens: 8192, vision_max_tokens: 8192}
+#   - {id: gpt-6-astra, label: "GPT-6 Astra", provider: openai,
+#      reasoning_effort: low, max_tokens: 8192, vision_max_tokens: 8192}
+#   - {id: gpt-6-luna, label: "GPT-6 Luna", provider: openai,
+#      reasoning_effort: low, max_tokens: 8192, vision_max_tokens: 8192}
+#   - {id: gemini-3.8-flash, label: "Gemini 3.8 Flash", provider: google,
+#      thinking_level: low, max_tokens: 8192, vision_max_tokens: 8192}
+#   - {id: qwen3.8-flash, label: "Qwen 3.8 Flash", provider: qwen,
+#      max_tokens: 8192, vision_max_tokens: 8192}
+#   - {id: grok-4.7, label: "Grok 4.7", provider: xai,
+#      reasoning_effort: low, max_tokens: 8192, vision_max_tokens: 8192}
+#   # Local or open models on any OpenAI-compatible server. Say what it can do; it needs vision and tools.
+#   - {id: qwen3-vl-32b, label: "Qwen3-VL (local)", provider: openai_compatible,
+#      base_url: "http://localhost:11434/v1", vision: true, tools: true, context: 64000}
+#   # A hosted compatible endpoint whose key is in another environment variable:
+#   - {id: meta-llama/llama-4-maverick, label: "Llama 4", provider: openai_compatible,
+#      base_url: "https://openrouter.ai/api/v1", api_key_env: OPENROUTER_API_KEY}
+# Optional per model: max_tokens (default 1024; raise it for reasoning models, whose thinking counts).
+# vision_max_tokens overrides the vision-step cap (reasoning models need room for thinking and tools).
+# Claude models: effort (low | medium | high | xhigh | max) and thinking (adaptive | disabled | between_tools);
+# left out, the model's defaults apply. OpenMob's default list runs Haiku 5.5 at high effort.
+#   e.g. - {id: claude-haiku-5-5, label: "Haiku 5.5 (fast)", effort: low, thinking: disabled}
+# openai_compatible_base_url: http://localhost:11434/v1   # default for compatible models without base_url
+# Qwen defaults to Singapore; use the endpoint matching your key's region/workspace.
+# QWEN_BASE_URL / XAI_BASE_URL override these settings in the environment.
+# qwen_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+# xai_base_url: https://api.x.ai/v1
+max_steps: 40
+# Actions the model may take from one reply (1: one per turn). 2-3 lets it chain predictable ones
+# (a chess piece then its square; type then Enter) with a look in between; any surprise ends the turn.
+max_actions_per_turn: 1             # OPENMOB_MAX_ACTIONS=3 to try it without editing this file
+form_actions_per_turn: 4            # on a form (2+ text fields, no password field); 1 turns it off; OPENMOB_FORM_ACTIONS
+# Take the screenshot while the app and element list are read, not after (saves a few hundred ms
+# per look). Off until measured on real phones.
+parallel_observe: false             # OPENMOB_PARALLEL_OBSERVE=on to try it
+# Replay UI paths that worked before: a request seen before runs its stored taps, scrolls, Backs and app
+# launches without the main model while each screen matches (every check still applies). Only successful
+# navigation-only tasks that typed nothing and asked nothing are stored (docs/design/fewer-model-calls.md).
+replay_paths: false                 # OPENMOB_REPLAY=on to try it
+# Plan with the model, execute with the classifier: on a cold run one planning call lays the request out as sub-goals
+# with a screen cue each, then the classifier picks each tap, scroll, Back or app launch toward the current sub-goal
+# (every check still applies). The model takes over when a screen doesn't fit. Needs Jev (docs/design/fewer-model-calls.md).
+plan_execute: false                 # OPENMOB_PLAN_EXECUTE=on to try it
+# Settings deep links (docs/design/deep-links.md): open_settings_page on phones whose app can open Settings pages
+# directly. The direct step opens the page a request plainly names ("Open Settings and go to Display", "open Chrome's
+# notification settings and tell me whether they're allowed": the app by its exact installed name) as the task's first
+# action, before any classifier or main-model decision, through the tool's every check. Off only for comparisons.
+deep_links: true                    # OPENMOB_DEEP_LINKS=off to compare
+deep_links_fast: true               # OPENMOB_DEEP_LINKS_FAST=off to compare
+# In-app links (docs/design/app-links.md): the open_link catalog tool (a YouTube search, Maps directions, a Play Store
+# page, a WhatsApp chat… from one link), and open_url saying which app took a link and when the app it belongs to
+# didn't. Every link passes the same checks as open_url. Off only for comparisons.
+app_links: true                     # OPENMOB_APP_LINKS=off to compare
+# The fast path for links: a request that plainly names one `view` entry ("search YouTube for lofi") opens it as the
+# task's first action with no main-model decision (a value the request doesn't give plainly comes from the small text
+# model). Only `view` entries, never drafts; skipped when the phone says the link wouldn't open in its app.
+app_links_fast: true                # OPENMOB_APP_LINKS_FAST=off to compare
+
+# Spoken app names -> package. Run `openmob apps` to find package names.
+aliases: {}
+  # Example; replace with the real package from `openmob apps`:
+  # where winds meet: com.example.wherewindsmeet
+  # youtube: com.google.android.youtube
+
+# Phone
+# adb_serial: R58M12ABCDE          # only needed with several phones connected
+screenshot_max_side: 1280
+settle_delay: 0.8                  # seconds to let the screen update after each action
+launch_settle_delay: 3.0
+adaptive_settle: true              # wait only until the screen stops changing (capped at the delays above)
+settle_quiet_ms: 300               # how long without screen changes counts as settled
+verify_taps: true                  # re-check a tap target just before tapping (OpenMob app phones)
+ui_tree: auto                      # auto | always | never (accessibility tree; empty in games)
+ocr: true                          # Apple Vision OCR for screens without an accessibility tree
+# Android permission dialogs are dismissed with Back by the loop (no model call): Android ignores OpenMob's taps on
+# their buttons, so the app doesn't get the permission. The policy below is for when taps work again.
+auto_permission_dialogs: true
+# permission_prompts:
+#   notifications: allow             # allow | deny
+#   location_accuracy: approximate   # approximate | precise
+#   location: once                   # once ("Only this time") | while_using | ask | deny; same for camera,
+#   camera: once                     # microphone, photos, nearby_devices, contacts, phone, sms, calendar…
+#   persistent_grants: ask           # ask | allow: a lasting Allow for contacts, SMS, phone, calendar, body
+#                                    # sensors, nearby devices when the dialog offers no one-time option
+
+# Vision steps (docs/benchmarks.md, "Vision steps")
+keep_screenshots: 2                # screenshots left in the history after a trim
+history_trim: batch                # batch: trim only past history_max_screenshots (prompt-cache friendly) | rolling
+history_max_screenshots: 4
+history_cache: true                # Anthropic: cache the conversation, not only the system prompt and tools
+vision_max_side_labeled: 768       # smaller screenshot on richly labeled screens (0: always screenshot_max_side)
+vision_labeled_min_elements: 8
+vision_brief: true                 # at most one short sentence before the tool call
+vision_max_tokens: 512             # output cap for vision steps (0: the model's own); cut-off replies are retried
+vision_stream: false               # Anthropic: run each tool call as soon as it has streamed in
+
+# Model calls (hosted providers): a stalled call fails the step instead of holding the task for minutes.
+# Self-hosted providers (openai_compatible, qwen: often a local model) keep the SDK's 600 s and 2 retries unless
+# model_timeout_self_hosted is true or OPENMOB_MODEL_TIMEOUT_S is set.
+model_timeout_s: 20                # calls with up to 512 output tokens (vision steps); 0: SDK defaults (600 s, 2 retries)
+model_timeout_long_s: 60           # bigger calls (thinking models' room, full-length retries, text questions)
+model_retries: 3                   # a connection failure, 429 or overload is tried again this many times (a timeout once)
+model_retry_max_wait_s: 5          # longest Retry-After honored; a longer one fails at once
+model_timeout_self_hosted: false   # true: the timeouts and retry above cover openai_compatible and qwen too
+answer_check: true                 # read/list/report requests only: list items and names in an answer no screen (or
+                                   # saved preference) showed get one note to the model, then only their count is
+                                   # kept as unverified (event data); OPENMOB_ANSWER_CHECK=off
+
+# TypeSafe Jev: text-only classifier for screen state, tap risk, and app picking.
+# Turns on automatically when TYPESAFE_API_KEY is set.
+jev_model: jev-latest
+jev_min_confidence: 0.6
+jev_risk_threshold: 0.5            # ask before taps Jev rates at least this risky
+jev_auto_wait_seconds: 30          # longest time to wait on screens Jev calls "loading"
+jev_enabled: true                  # false (or OPENMOB_JEV=off) runs without Jev even with TYPESAFE_API_KEY set
+fast_path: "off"                   # off | fast_tier | on: Jev drives labeled screens without the main model
+fast_path_min_probability: 0.7
+fast_path_min_confidence: 0.6
+fast_path_min_elements: 3
+# fast_path_text_model: claude-haiku-5-5   # writes typed text; default: resolver_model
+fast_path_lazy_screenshot: true    # fast steps skip the screenshot unless the step goes to vision
+jev_one_request: true              # one Jev request per step (screen state, next step, tap risk)
+jev_risk_heads: 40                 # candidate targets whose tap risk that request asks about
+fast_path_direct_launch: true      # an app named exactly in the request opens without the small text model
+fast_path_done: true               # Jev may finish navigation-only tasks without the vision confirmation (OPENMOB_FAST_DONE=off)
+fast_path_done_min_probability: 0.85
+# Faster mode (docs/design/faster-mode.md): small screenshots of screens without readable text go to TypeSafe,
+# only on phones whose owner turned it on in the OpenMob app (screen lock). Off on every phone by default;
+# nothing in this file can turn it on.
+faster_mode: phone_opt_in          # phone_opt_in | disabled (this server never sends an image)
+jev_image_model: jev-1.14.0        # pinned (images are TypeSafe "Dreamer-ready"); never a moving alias
+jev_image_side: 768
+jev_image_timeout_ms: 600          # one image request at most; a later answer is discarded
+
+# Ask before tapping anything that matches these words.
+confirm_keywords: [buy, purchase, pay, payment, checkout, top up, recharge, subscribe,
+                   send, post, publish, delete, remove, uninstall, transfer, place order, confirm order,
+                   share to, forward to]
+# Permission modes (docs/safety.md#permission-modes): a phone's mode until its owner picks one.
+default_permission_mode: auto      # ask | plan | auto (looser modes are approved on the phone itself)
+# Money words: they ask even when requested (one prompt per purchase), and are refused under never.
+money_keywords: [buy, pay, order, checkout, subscribe, purchase, transfer, book, donate, place order,
+                 payment, top up, recharge]
+
+# Spoken replies on the Mac
+speak: true
+# voice: Samantha
+
+# Phone web page (http://<mac-ip>:8765/?t=<token>)
+server_port: 8765
+# server_token: pick-a-fixed-token   # otherwise a new one is generated each run
+
+# Developer API (/v1, accounts mode). Tiers map public names to the model that runs them (any provider;
+# add provider: when the name doesn't show it); API responses show only the tier name. Limits are per API key.
+# api_tiers:
+#   fast:     {model: claude-haiku-5-5, credits_per_step: 1}
+#   balanced: {model: claude-sonnet-5-5, credits_per_step: 3}
+#   best:     {model: claude-opus-5-5, credits_per_step: 10}
+# api_default_tier: balanced
+# api_rate_per_minute: 60
+# api_max_concurrent_tasks: 2
+# api_daily_tasks: 200
+# api_account_daily_tasks: 1000   # all of an account's keys together
+# api_account_daily_credits: 0    # 0 = unlimited
+# api_max_steps: 40
+# MCP drive sessions (an outside agent driving step by step, docs/design/mcp-drive.md): a session with no
+# command for this long ends, and so does one older than api_drive_max_seconds.
+# api_drive_idle_seconds: 120
+# api_drive_max_seconds: 1800
+# Package-name patterns API tasks may not open unless the phone's owner allows it (see config.py for the defaults).
+# sensitive_apps: [bank, wallet, paypal, 1password]
+
+# Delete task text (saved chats, orchestration plans and results, webhook bodies) older than this
+# many days (0 = keep forever). Billing totals and the hashed audit log are kept.
+# history_retention_days: 30
+# Step and event rows are written on the agent's thread (the default). OPENMOB_HISTORY_WRITER=on moves them to one
+# background thread (flushed before every read and at shutdown; off for launch: no measured task-time gain, and
+# rows still queued are lost on SIGKILL).
+
+# The oldest phone app (its versionCode: Settings › About on the phone) this server accepts tasks for.
+# An older app stays connected, so Stop and Disconnect work, but gets no tasks (app_update_required)
+# and shows "Update required" with a download link. 0 = no minimum. OPENMOB_MIN_APP_VERSION sets it too.
+# min_app_version: 0
+
+# The signed-out landing page's "Request an invite" buttons open an email to this address (subject "OpenMob invite
+# request"). Unset: the buttons are hidden. OPENMOB_INVITE_EMAIL sets it too.
+# invite_email: invites@example.com

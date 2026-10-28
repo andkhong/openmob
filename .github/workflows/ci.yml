@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Third-party actions are pinned by full commit SHA (the comment names the release it was): a moved tag can't change
+# what runs here. To update one, look up the new tag's commit (git ls-remote --tags https://github.com/<owner>/<repo>).
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"   # pyproject allows 3.11+; the Docker image runs 3.13
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev,openai,gemini]'
+      - name: Gatekeeper fixtures are up to date
+        run: |
+          python tests/fixtures/gatekeeper/build.py
+          git diff --exit-code tests/fixtures/gatekeeper
+      - name: pytest
+        run: python -m pytest -q
+
+  android:
+    name: Android tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0   # the app's versionCode counts commits
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3  # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407  # v3.2.2
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4.4.3
+      - name: Unit tests and lint
+        working-directory: android
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug
+
+  gitleaks:
+    name: Secret scan
+    # Pull requests, and every push to main (a direct push skips the pull request scan).
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the workflow's own token
+          # Required when the repository is owned by a GitHub organisation (gitleaks-action refuses to run without
+          # it): a free license key from gitleaks.io, stored as the repository secret GITLEAKS_LICENSE. A repository
+          # owned by a personal account doesn't need it (the secret is then empty).
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

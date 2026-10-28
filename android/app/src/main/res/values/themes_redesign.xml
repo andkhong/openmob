@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window behind the Compose redesign (RedesignActivity): no action bar, the ground colour while it loads. -->
+    <style name="Theme.OpenMob.Redesign" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/rd_ground</item>
+    </style>
+    <color name="rd_ground">#F3F5F8</color>
+    <color name="rd_signal">#1F4FE0</color>
+    <color name="rd_icon_background">#0E1621</color>
+</resources>

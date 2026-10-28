@@ -1,0 +1,584 @@
+"""Configuration loaded from config.yaml plus environment variables."""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+
+import yaml
+
+from .permissions import (DEFAULT_APP_CATEGORIES, DEFAULT_CREDENTIAL_TERMS, DEFAULT_MONEY_KEYWORDS,
+                          DEFAULT_SETTINGS_ASK, DEFAULT_SETTINGS_EVERYDAY, DEFAULT_SETTINGS_REFUSE, DEFAULT_SKIP_PHRASES,
+                          DEFAULT_START_FLOW_WORDS, DEFAULT_TERMINAL_WORDS, PERMISSION_DEFAULTS,
+                          permission_values)
+
+DEFAULT_CONFIRM_KEYWORDS = [
+    "buy", "purchase", "pay", "payment", "checkout", "top up", "recharge",
+    "subscribe", "send", "post", "publish", "delete", "remove", "uninstall",
+    "transfer", "place order", "confirm order", "share to", "forward to",
+]
+
+DEFAULT_MODELS = [
+    {"id": "claude-sonnet-5-5", "label": "Sonnet 5.5 (balanced, recommended)", "provider": "anthropic"},
+    {"id": "claude-opus-5-5", "label": "Opus 5.5 (smartest, slower, pricier)", "provider": "anthropic"},
+    {"id": "claude-fable-5-1", "label": "Fable 5.1", "provider": "anthropic"},
+    # Low effort on labeled screens, canvas_effort on canvas ones (owner's choice, 2026-10-08: measured,
+    # low was 15-35% faster per decision on Settings-style steps). Thinking counts toward max_tokens, so
+    # the vision step gets the same room instead of the 512-token cap, which would cut it off.
+    {"id": "claude-haiku-5-5", "label": "Haiku 5.5 (fastest, cheapest)", "provider": "anthropic",
+     "effort": "low", "max_tokens": 8192, "vision_max_tokens": 8192},
+    {"id": "gpt-6.1-sol", "label": "GPT-6.1 Sol", "provider": "openai", "context": 1_050_000,
+     "reasoning_effort": "low", "max_tokens": 8192, "vision_max_tokens": 8192},
+    {"id": "gpt-6-astra", "label": "GPT-6 Astra", "provider": "openai", "context": 1_050_000,
+     "reasoning_effort": "low", "max_tokens": 8192, "vision_max_tokens": 8192},
+    {"id": "gpt-6-luna", "label": "GPT-6 Luna", "provider": "openai", "context": 1_050_000,
+     "reasoning_effort": "low", "max_tokens": 8192, "vision_max_tokens": 8192},
+    {"id": "gemini-3.8-flash", "label": "Gemini 3.8 Flash", "provider": "google", "context": 1_048_576,
+     "thinking_level": "low", "max_tokens": 8192, "vision_max_tokens": 8192},
+    {"id": "qwen3.8-flash", "label": "Qwen 3.8 Flash", "provider": "qwen", "context": 1_000_000,
+     "max_tokens": 8192, "vision_max_tokens": 8192},
+    {"id": "grok-4.7", "label": "Grok 4.7", "provider": "xai", "context": 500_000,
+     "reasoning_effort": "low", "max_tokens": 8192, "vision_max_tokens": 8192},
+]
+
+# Who serves a model. Keys come from the environment only; `openai_compatible` is any endpoint that
+# speaks OpenAI Chat Completions (vLLM, Ollama, LM Studio, OpenRouter…) at a `base_url`.
+PROVIDERS = ("anthropic", "openai", "google", "qwen", "xai", "openai_compatible")
+# Optional per-model settings in `models:` besides id, label and provider.
+MODEL_OPTIONS = ("base_url", "api_key_env", "max_tokens", "vision", "tools", "context", "description", "speed",
+                 "reasoning_effort", "thinking_level", "vision_max_tokens", "effort", "thinking")
+# Claude models: `effort` is output_config.effort; `thinking` is the thinking type. Which pairs a model
+# accepts is the API's rule (Haiku 5.5: disabled at effort high or below; Sonnet 5.5: between_tools).
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_THINKING = ("adaptive", "disabled", "between_tools")
+
+
+def infer_provider(model_id: str) -> str | None:
+    """The provider a model id belongs to, from its name (None: say `provider:` in the config)."""
+    name = model_id.lower()
+    if name.startswith("claude"):
+        return "anthropic"
+    if name.startswith(("gpt-", "chatgpt", "o1", "o3", "o4", "o5")):
+        return "openai"
+    if name.startswith(("gemini", "gemma")):
+        return "google"
+    if name.startswith("qwen"):
+        return "qwen"
+    if name.startswith("grok"):
+        return "xai"
+    return None
+
+
+def normalize_model(entry) -> dict:
+    """One `models:` entry as {id, label, provider, ...options}."""
+    if not isinstance(entry, dict):
+        entry = {"id": entry}
+    if "api_key" in entry:
+        raise ValueError(f"models: {entry['id']}: keys stay out of config.yaml; name an environment variable with api_key_env")
+    model = {"id": str(entry["id"]), "label": str(entry.get("label") or entry["id"])}
+    provider = entry.get("provider") or infer_provider(model["id"])
+    if provider not in PROVIDERS:
+        raise ValueError(f"models: {model['id']} needs a provider: one of {', '.join(PROVIDERS)}")
+    model["provider"] = provider
+    model.update({k: entry[k] for k in MODEL_OPTIONS if entry.get(k) is not None})
+    if model.get("effort") is not None and model["effort"] not in CLAUDE_EFFORTS:
+        raise ValueError(f"models: {model['id']}: effort is one of {', '.join(CLAUDE_EFFORTS)}")
+    if model.get("thinking") is not None and model["thinking"] not in CLAUDE_THINKING:
+        raise ValueError(f"models: {model['id']}: thinking is one of {', '.join(CLAUDE_THINKING)}")
+    return model
+
+# Developer API tiers: the public name -> the model that runs it, and what a step costs in credits.
+# The mapping is internal; API responses only ever show the tier name.
+DEFAULT_API_TIERS = {
+    "fast": {"model": "claude-haiku-5-5", "credits_per_step": 1},
+    "balanced": {"model": "claude-sonnet-5-5", "credits_per_step": 3},
+    "best": {"model": "claude-opus-5-5", "credits_per_step": 10},
+}
+
+# Apps that API tasks may not open or operate unless the phone's owner allows it
+# (matched against the package name, case-insensitively).
+DEFAULT_SENSITIVE_APPS = [
+    r"bank", r"banking", r"\bpay\b", r"\.pay", r"wallet", r"paypal", r"venmo", r"squareup\.cash", r"zelle",
+    r"chase", r"wellsfargo", r"bofa", r"\.citi", r"revolut", r"monzo", r"transferwise", r"coinbase", r"binance",
+    r"crypto", r"spay", r"walletnfcrel", r"1password", r"bitwarden", r"lastpass", r"dashlane", r"keepass",
+    r"\.keeper", r"authenticator", r"authy",
+]
+
+FAST_PATH_MODES = ("off", "fast_tier", "on")
+
+REMOVED_KEYS = {"hotkey", "whisper_model"}
+SECRET_FIELDS = {"api_key", "openai_api_key", "google_api_key", "qwen_api_key", "xai_api_key", "compatible_api_key", "workspace_id", "jev_api_key", "source"}  # Mac push-to-talk was removed
+
+CONFIG_LOCATIONS = [
+    Path("config.yaml"),
+    Path.home() / ".config" / "openmob" / "config.yaml",
+]
+
+
+@dataclass
+class Config:
+    # Agent
+    model: str = "claude-sonnet-5-5"
+    resolver_model: str = "claude-haiku-5-5"
+    # Models the dashboard may switch a phone to (an allowlist; anything else is refused):
+    # {id, label, provider} plus optional base_url, api_key_env, max_tokens, vision, tools, context.
+    models: list[dict] = field(default_factory=lambda: [dict(m) for m in DEFAULT_MODELS])
+    # Default endpoint for `openai_compatible` models without their own base_url (not a secret).
+    openai_compatible_base_url: str | None = None
+    qwen_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    xai_base_url: str = "https://api.x.ai/v1"
+    max_steps: int = 40
+    keep_screenshots: int = 2
+    # Vision-step speedups (docs/benchmarks.md, "Vision steps"). Each can be switched off to compare.
+    # History trimming: "batch" lets screenshots pile up to history_max_screenshots, then drops the
+    # oldest down to keep_screenshots at once, so earlier messages stay byte-identical between steps
+    # and the provider's prompt cache covers them. "rolling" (before): keep_screenshots every step.
+    history_trim: str = "batch"  # batch | rolling
+    history_max_screenshots: int = 4
+    # Anthropic: mark the end of the conversation for prompt caching (other providers cache on their own).
+    history_cache: bool = True
+    # A smaller screenshot for vision steps on screens with a rich labeled element list (not OCR, not a
+    # game): its long side in px (0: always the full screenshot_max_side).
+    vision_max_side_labeled: int = 768
+    vision_labeled_min_elements: int = 8  # labeled accessibility elements that make a screen "rich"
+    # Ask for the tool call with at most one short sentence of thought.
+    vision_brief: bool = True
+    # max_tokens for vision steps (0: the model's own); a reply cut off by it is asked again in full.
+    vision_max_tokens: int = 512
+    # Anthropic: stream the reply and run each tool call as soon as its block is complete. Off: the
+    # gain is only the tail of the reply (tens of ms), and it holds the stream open during approvals.
+    vision_stream: bool = False
+    # Model calls (models.CallPolicy, 2026-10-20): a call with up to 512 output tokens (a vision step) gets
+    # model_timeout_s, a bigger one model_timeout_long_s; a connection failure, 429 or overload is tried again
+    # model_retries times after a growing wait (0.25-1 s, 4x each time, or the provider's Retry-After; all up to
+    # model_retry_max_wait_s, a longer Retry-After fails at once), a timeout once. model_timeout_s: 0 turns all of it off (the SDKs' 600 s and 2 retries).
+    # OPENMOB_MODEL_TIMEOUT_S and OPENMOB_MODEL_RETRIES override.
+    model_timeout_s: float = 20.0
+    model_timeout_long_s: float = 60.0
+    model_retries: int = 3
+    model_retry_max_wait_s: float = 5.0
+    # The self-hosted providers (openai_compatible, qwen) get the timeouts and retry above only with this on;
+    # otherwise they keep the SDK's own 600 s and 2 retries, as before 2026-10-20 (a local vision model can take
+    # more than 20 s on an image; review 2026-10-21, I2). Setting OPENMOB_MODEL_TIMEOUT_S turns it on.
+    model_timeout_self_hosted: bool = False
+    # The answer check (agent/answer_check.py), on requests that ask to read, list or report something: list items and
+    # names in a done summary that no screen or saved preference showed get the model one note to correct them, then
+    # only their count is reported as unverified. OPENMOB_ANSWER_CHECK=off turns it off.
+    answer_check: bool = True
+    # Claude models: the effort for a decision on a canvas screen (no readable labels: games, chess, a
+    # drawing app), where reading the picture is the hard part; labeled screens keep the model's own effort.
+    # Empty: the model's effort everywhere. OPENMOB_CANVAS_EFFORT overrides.
+    canvas_effort: str = "high"
+    # Settings deep links (open_settings_page) on phones that offer them. Off only for comparisons:
+    # OPENMOB_DEEP_LINKS=off.
+    deep_links: bool = True
+    # The direct Settings step: a request that plainly names one Settings page ("Open Settings and go to Display"),
+    # or an app's own page ("open Chrome's notification settings and tell me whether they're allowed"; the app by
+    # its exact installed name), opens it as the task's first action, with no classifier or main-model decision,
+    # through the tool's every check. Off: the page is opened only when the classifier chooses to launch Settings,
+    # or the main model calls the tool. OPENMOB_DEEP_LINKS_FAST=off to compare.
+    deep_links_fast: bool = True
+    # In-app links (docs/design/app-links.md, agent/app_links.py): the open_link catalog tool (a YouTube search, Maps
+    # directions, a Play Store page… from one link), and open_url reporting which app took the link and when the
+    # app it belongs to didn't. Off only for comparisons: OPENMOB_APP_LINKS=off.
+    app_links: bool = True
+    # The fast path for links: a request that plainly names one `view` catalog entry ("search YouTube for lofi")
+    # opens it as the task's first action, with no main-model decision; a value the request doesn't give plainly
+    # comes from the small text model. OPENMOB_APP_LINKS_FAST=off to compare.
+    app_links_fast: bool = True
+    # Actions the main model may take from one reply (1: one per turn). Above 1 it may chain a few whose
+    # next screen it can predict (a chess piece then its square, type then Enter): each still passes
+    # every check, and the rest of the turn is skipped at any error, owner prompt or unexpected screen.
+    # Streaming actions (vision_stream) is off while this is above 1. OPENMOB_MAX_ACTIONS overrides.
+    max_actions_per_turn: int = 1
+    # On a form (fast.is_form: two or more text fields, no password field) the main model may chain up to this many
+    # actions a turn (tap a field, type, tap the next; only field taps and typing without submit, at most 4: security
+    # review 6), with the same checks as max_actions_per_turn; elsewhere
+    # max_actions_per_turn applies. AndroidWorld 2026-10-27, 8 form tasks: 4 of 6 that ran out of steps passed, model
+    # turns down about 25%, no regressions (owner decision 2026-10-27). 1 turns it off. OPENMOB_FORM_ACTIONS overrides.
+    form_actions_per_turn: int = 4
+    # Take the screenshot while the app and element reads run, instead of after them (phones answer
+    # calls concurrently). Off until measured on real phones. OPENMOB_PARALLEL_OBSERVE=on overrides.
+    parallel_observe: bool = False
+    # Replay UI paths that worked before (agent/replay.py, docs/design/fewer-model-calls.md): on a request seen
+    # before, the stored path's taps, scrolls, Backs and app launches run without the main model while each
+    # screen matches, through every check an action gets. Only successful navigation-only tasks that typed
+    # nothing, asked nothing and tapped nothing risky are stored. Off until measured. OPENMOB_REPLAY=on overrides.
+    replay_paths: bool = False
+    replay_min_overlap: float = 0.7  # the share of a stored screen's labels that must be on screen to replay its step
+    replay_max_goals: int = 100  # requests whose paths are kept (the oldest go first)
+    # Also store paths from isolated callers (API keys). Off: the owner's call (2026-10-08); on only to
+    # warm the cache in API-driven benchmarks. OPENMOB_REPLAY_STORE_API=on overrides.
+    replay_store_api: bool = False
+    # Owner-confirmed preferences memory (openmob/memory.py). Off until the security review. OPENMOB_MEMORY=on overrides.
+    memory: bool = False
+    # Plan with the main model, execute with the classifier (agent/plan.py, docs/design/fewer-model-calls.md): on a
+    # cold run one dedicated model call before the step loop (its only tool: plan_steps) lays the request out as
+    # sub-goals with a screen cue each; a reply without a plan changes nothing. Then each step asks the classifier
+    # about the current sub-goal and runs its tap, scroll, Back or app launch through every check. The model takes over, told the plan and progress, when the classifier isn't sure, a step changes
+    # nothing, a cue doesn't appear within plan_max_steps_per_goal steps, a popup / login / loading screen comes up,
+    # the next step would type, or the user corrects. Needs Jev. Off until measured. OPENMOB_PLAN_EXECUTE=on overrides.
+    plan_execute: bool = False
+    plan_max_steps_per_goal: int = 4
+    settle_delay: float = 0.8
+    # The most to wait after a scroll: a fling keeps the list moving past settle_delay (measured on a
+    # Samsung: 0.8 s never sufficed), so the next look read moving positions and its tap was refused.
+    # Adaptive settle still returns as soon as the list stops. 1.2 s (measured 2026-10-08, 3 runs per
+    # value): no refused taps and 1-2 fewer model calls at the same task time as 0.8 s; 1.6 s was no
+    # better and slower on long lists. OPENMOB_SCROLL_SETTLE_S overrides.
+    scroll_settle_delay: float = 1.2
+    launch_settle_delay: float = 3.0
+    # Adaptive settle: after an action, wait only until the screen stops changing (no window or content
+    # change for settle_quiet_ms), capped at the delays above. Needs a phone whose app offers wait_idle;
+    # others keep the fixed delays (adb: launches end once the app is in front). OPENMOB_ADAPTIVE_SETTLE=off.
+    adaptive_settle: bool = True
+    settle_quiet_ms: int = 300  # OPENMOB_SETTLE_QUIET_MS sets it too (to compare e.g. 200)
+    # "Wait until" instead of blind waits (agent/waiting.py), on phones whose element list is quick to read
+    # (the OpenMob app). After launch_app / open_url: while a spinner or "Loading" is on screen, keep
+    # waiting, up to this long in all (0: only the settle above).
+    launch_wait_seconds: float = 10.0
+    # After tapping Install in the Play Store: wait until its button reads Open/Play again (0: don't).
+    install_wait_seconds: float = 90.0
+    # Re-read the screen's elements just before tap_element, and don't tap one that moved or vanished
+    # (only on phones whose element list is quick to read: the OpenMob app).
+    verify_taps: bool = True
+    ui_tree: str = "auto"  # auto | always | never
+    confirm_keywords: list[str] = field(default_factory=lambda: list(DEFAULT_CONFIRM_KEYWORDS))
+    # Ask before risky taps (buy/send/delete…): unrequested = only if the request didn't ask for it.
+    confirm_actions: str = "unrequested"  # unrequested | always | never
+    # Permission modes (docs/safety.md#permission-modes): a phone's mode when it has no setting yet.
+    default_permission_mode: str = "auto"  # ask | plan | auto (looser modes need the phone's own approval)
+    # Money actions ask even when the request asked for them (once per task and app).
+    money_keywords: list[str] = field(default_factory=lambda: list(DEFAULT_MONEY_KEYWORDS))
+    # Steps on the way to a commit point ("Add to cart", "Proceed to checkout"): never asked about.
+    confirm_skip_phrases: list[str] = field(default_factory=lambda: list(DEFAULT_SKIP_PHRASES))
+    # Categories a trusted entry may name: category -> package-name parts.
+    app_categories: dict[str, list[str]] = field(default_factory=lambda: {k: list(v) for k, v in DEFAULT_APP_CATEGORIES.items()})
+    # Settings tiers: security-critical pages are refused, everyday ones never ask, the rest ask.
+    settings_refuse_terms: list[str] = field(default_factory=lambda: list(DEFAULT_SETTINGS_REFUSE))
+    settings_everyday_terms: list[str] = field(default_factory=lambda: list(DEFAULT_SETTINGS_EVERYDAY))
+    settings_ask_terms: list[str] = field(default_factory=lambda: list(DEFAULT_SETTINGS_ASK))
+    # Autofill / saved-credential suggestions: asked about, refused under `never`.
+    credential_terms: list[str] = field(default_factory=lambda: list(DEFAULT_CREDENTIAL_TERMS))
+    # After an approved payment: the one follow-up commit tap these name is covered (FOLLOWUP_SECONDS).
+    money_terminal_words: list[str] = field(default_factory=lambda: list(DEFAULT_TERMINAL_WORDS))
+    # Money words that start a new flow: they always ask again.
+    money_start_words: list[str] = field(default_factory=lambda: list(DEFAULT_START_FLOW_WORDS))
+    ocr: bool = True  # Apple Vision OCR when the app has no accessibility tree (games)
+    # A tap on a canvas or play area (nothing in the accessibility tree says what is there): the words drawn near
+    # the point (OCR) add caution to the gate, as the model's own words for the target do, so a drawn "Play"
+    # whose button says "Buy 500 gems $4.99" asks. Found by the Jev taps emulator check, 2026-10-17.
+    gate_canvas_words: bool = True
+    # Android's runtime permission dialogs are answered by the loop with no model call (agent/permission_dialogs.py),
+    # by these owner defaults: notifications allow | deny; location_accuracy approximate | precise; the other types
+    # (location, camera, microphone, photos, nearby_devices…) deny | ask | once | while_using. Never "Allow all the
+    # time". A request that talks about permissions ("don't allow notifications") is left to the model.
+    auto_permission_dialogs: bool = True
+    permission_prompts: dict[str, str] = field(default_factory=lambda: dict(PERMISSION_DEFAULTS))
+
+    # Developer API (/v1): tiers, per-key limits, and apps API tasks can't touch by default.
+    api_tiers: dict[str, dict] = field(default_factory=lambda: {k: dict(v) for k, v in DEFAULT_API_TIERS.items()})
+    api_default_tier: str = "balanced"
+    api_rate_per_minute: int = 60  # requests per key per minute
+    api_max_concurrent_tasks: int = 2  # unfinished tasks per key
+    api_daily_tasks: int = 200  # tasks per key per UTC day
+    api_daily_credits: int = 0  # credits per key per UTC day, counting running tasks (0: unlimited)
+    api_max_running_orchestrations: int = 3  # multi-phone runs in progress per key
+    # Account-wide daily caps (UTC), across all of an account's keys, so more keys don't mean more quota.
+    api_account_daily_tasks: int = 1000
+    api_account_daily_credits: int = 0  # 0: unlimited
+    api_max_running_orchestrations_per_account: int = 10
+    # A task whose question nobody answers ends (failed, question_timeout) after this long. 0: never.
+    question_timeout_seconds: int = 300
+    # A secure lock screen mid-task pauses the task ("Unlock your phone to continue") for up to this long,
+    # then it fails with reason phone_locked. 0: fail at once.
+    locked_wait_seconds: float = 300.0
+    # A system dialog the phone can't read (Android 14+ permission dialogs) pauses the task while the owner answers
+    # it on the phone, for up to this long; then it fails with reason needs_owner_dialog.
+    owner_dialog_wait_seconds: float = 300.0
+    # Gatekeeper phones: an act refused because another prompt is open on the phone (gate_prompt_open: a prompt
+    # left from a stopped task on an older app, or the 1 s cool-down after any prompt) is tried again every
+    # second for up to this long, instead of failing the step. 0: report it at once (before 2026-10-10).
+    gate_prompt_wait_seconds: float = 30.0
+    # Gatekeeper phones: an act refused by the phone's rate limit (gate_rate_limited, e.g. 6 prompts in 10 minutes)
+    # waits the time the phone gives when it's at most this long; longer, or no time given (paused after denials),
+    # ends the task. Never the model's own guess at a cooldown (2026-10-20).
+    gate_rate_wait_seconds: float = 150.0
+    api_max_steps: int = 40  # the most steps a developer may ask for
+    # MCP drive sessions (docs/design/mcp-drive.md): an outside agent driving step by step. A session with no
+    # command for api_drive_idle_seconds ends; so does one older than api_drive_max_seconds.
+    api_drive_idle_seconds: int = 120
+    api_drive_max_seconds: int = 1800
+    sensitive_apps: list[str] = field(default_factory=lambda: list(DEFAULT_SENSITIVE_APPS))
+    # Retention: task text (chats, orchestration plans and results, webhook bodies) older than this
+    # many days is deleted; billing totals and the hashed audit log stay. 0 keeps everything forever.
+    history_retention_days: int = 30
+    # The oldest phone app (its versionCode) this server lets act: a phone below it stays connected (Stop and
+    # Disconnect work) but gets no tasks (app_update_required) and is told to update. 0: no minimum.
+    # OPENMOB_MIN_APP_VERSION sets it too. docs/phone-protocol.md §3.7.
+    min_app_version: int = 0
+    # Where the signed-out landing page's "Request an invite" mail goes (a mailto: link). Unset: those buttons are
+    # hidden and the page shows how to sign in with an invite. OPENMOB_INVITE_EMAIL sets it too.
+    invite_email: str | None = None
+
+    # TypeSafe Jev (text-only classifier). Enabled when TYPESAFE_API_KEY is set.
+    jev_model: str = "jev-latest"
+    jev_base_url: str = "https://api.typesafe.ai"
+    jev_min_confidence: float = 0.6
+    jev_risk_threshold: float = 0.5
+    jev_auto_wait_seconds: float = 30.0  # max time to wait on screens Jev calls "loading"
+    # false: run without Jev even when TYPESAFE_API_KEY is set (for comparisons). OPENMOB_JEV=off does the same.
+    jev_enabled: bool = True
+    # Faster mode (docs/design/faster-mode.md): small screenshots of screens without usable text go to TypeSafe
+    # (Jev images) to tell loading screens apart and name the screen's state. Each phone's owner turns it on in
+    # the OpenMob app, with the screen lock; every phone starts with it off, and nothing here can turn it on.
+    # "phone_opt_in": phones may turn it on; "disabled": this server never sends an image (the phones' setting
+    # is ignored). Any other value is refused.
+    faster_mode: str = "phone_opt_in"
+    # Pinned: images are TypeSafe "Dreamer-ready" (not production); 1.14.0 is the version the 2026-10-17
+    # benchmark measured. Never a moving alias (jev-preview, jev-latest).
+    jev_image_model: str = "jev-1.14.0"
+    jev_image_side: int = 768  # the long side of the image sent (the benchmark's size)
+    jev_image_timeout_ms: int = 600  # one image request at most; a slower answer is discarded, the step goes on
+    jev_image_min_confidence: float = 0.6  # below this, an image answer is ignored (today's behaviour)
+    jev_image_loading_looks: int = 2  # extra looks on a loading screen before the main model is asked anyway
+    jev_image_loading_wait_seconds: float = 10.0  # one loading wait at most (jev_auto_wait_seconds caps a task)
+    # The model's wait_until screen_changes on a treeless or sparse screen: a confident "ready" from J3 ends it early
+    # (about 1-2 s instead of the 3.5 s still exit). false: only the still exit.
+    jev_image_wait_ready: bool = True
+    # Jev taps (Faster mode step 2, docs/design/faster-mode.md §3.1): on a routine game screen (J1 menu, dialog or
+    # game over), Jev picks a routine action and Boxes its control, and the loop taps it without the main model,
+    # through every check a model tap goes through. Only while Faster mode is on; false turns just the taps off.
+    jev_taps: bool = True
+    jev_tap_actions: list[str] = field(default_factory=lambda: ["start", "continue", "dismiss"])  # the vocabulary
+    jev_tap_states: list[str] = field(default_factory=lambda: ["menu", "dialog", "game_over"])  # J1 states it may run on
+    jev_tap_min_probability: float = 0.8  # the routine action's probability
+    jev_tap_min_confidence: float = 0.7  # and Jev's confidence in it
+    # The safe tap rule (benchmark 2026-10-17: 1 false tap in 340): min(Box confidence, "visible?") >= this.
+    # Never below 0.5 (refused at start).
+    jev_tap_min_box: float = 0.5
+    jev_tap_max_consecutive: int = 3  # Jev taps in a row without a main-model step
+    jev_tap_max_misses: int = 2  # misses (no visible change) in a task before Jev taps stop for it
+    # Fast path (needs Jev): on screens with a usable element list, Jev picks the next operation and its
+    # target in one call and the step runs without the main model (a small text model writes any text).
+    # off | fast_tier (only tasks on the `fast` API tier's model) | on. OPENMOB_FAST_PATH sets it too.
+    # On by default since it measured 10.8 s -> 6.0 s on a labeled-app task (docs/benchmarks.md);
+    # without Jev it does nothing.
+    fast_path: str = "on"
+    fast_path_min_probability: float = 0.7  # the chosen operation's and target's probability
+    fast_path_min_confidence: float = 0.6  # and Jev's confidence in each
+    fast_path_min_elements: int = 3  # labeled elements a screen needs (fewer: the vision step)
+    fast_path_text_model: str | None = None  # writes text and app names; default: resolver_model
+    # Latency features on top of the fast path (docs/benchmarks.md). Each can be switched off to compare.
+    # Fast steps decide from the element list alone; the screenshot is taken only if the step goes to vision.
+    fast_path_lazy_screenshot: bool = True
+    # One Jev request per step: screen state, the fast path's heads and the risky-tap questions together.
+    jev_one_request: bool = True
+    jev_risk_heads: int = 40  # candidate targets whose tap risk that request asks (others: a separate check)
+    # An app the request names exactly (an installed app's label) opens without the small text model.
+    fast_path_direct_launch: bool = True
+    # Let the classifier finish a navigation-only task without the vision model's confirmation, when its
+    # DONE and "request looks complete" both reach fast_path_done_min_probability and the screen's title or
+    # selected tab matches what the request asked to open. On by default: in a real-phone test it fired only
+    # on the navigation task, never on tasks with side effects or answers. OPENMOB_FAST_DONE=off turns it off.
+    fast_path_done: bool = True
+    fast_path_done_min_probability: float = 0.85
+    # A plain navigation request ("Open Settings and go to Display") whose helper steps (the direct Settings page or
+    # link, the fast path) landed on a screen titled after its target ends there, without the vision model's done
+    # (Agent._landing_done; 2026-10-21, latency review rec. #4). Pure navigation only; any doubt keeps the vision
+    # check. OPENMOB_LANDING_DONE=off turns it off.
+    landing_done: bool = True
+
+    # Phone
+    adb_path: str = "adb"
+    adb_serial: str | None = None
+    screenshot_max_side: int = 1280
+    aliases: dict[str, str] = field(default_factory=dict)
+
+    # Spoken replies on the Mac (macOS `say`)
+    speak: bool = True
+    voice: str | None = None
+
+    # Phone-side web page
+    server_host: str = "0.0.0.0"
+    server_port: int = 8765
+    server_token: str | None = None
+
+    # Secrets come from the environment, never from the YAML file.
+    api_key: str | None = None  # ANTHROPIC_API_KEY
+    openai_api_key: str | None = None
+    google_api_key: str | None = None  # GEMINI_API_KEY or GOOGLE_API_KEY
+    qwen_api_key: str | None = None  # QWEN_API_KEY or DASHSCOPE_API_KEY
+    xai_api_key: str | None = None  # XAI_API_KEY
+    compatible_api_key: str | None = None  # OPENAI_COMPATIBLE_API_KEY (often not needed locally)
+    workspace_id: str | None = None
+    jev_api_key: str | None = None
+    source: Path | None = None
+
+
+FASTER_MODE_VALUES = ("phone_opt_in", "disabled")
+
+
+INVITE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+
+
+def check_invite_email(value) -> str | None:
+    """invite_email as a plain address, or None when unset. Anything else is a config error, so the landing page
+    never carries a malformed link (it is escaped there anyway)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str) or not INVITE_EMAIL.fullmatch(value.strip()) or len(value.strip()) > 254:
+        raise ValueError("invite_email must be a plain email address, such as invites@example.com")
+    return value.strip()
+
+
+def load_config(path: str | Path | None = None) -> Config:
+    candidates = [Path(path)] if path else CONFIG_LOCATIONS
+    data: dict = {}
+    source = None
+    for candidate in candidates:
+        if candidate.is_file():
+            data = yaml.safe_load(candidate.read_text()) or {}
+            source = candidate
+            break
+    else:
+        if path:
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+    for removed in REMOVED_KEYS:  # settings of features that no longer exist: ignore, don't fail
+        data.pop(removed, None)
+    known = {f.name for f in fields(Config)} - SECRET_FIELDS
+    unknown = set(data) - known
+    if unknown:
+        raise ValueError(f"Unknown config keys in {source}: {', '.join(sorted(unknown))}")
+
+    cfg = Config(**data)
+    cfg.aliases = {str(k): str(v) for k, v in (cfg.aliases or {}).items()}
+    cfg.api_key = os.environ.get("ANTHROPIC_API_KEY")
+    # Needed only for API keys that aren't scoped to a workspace.
+    if os.environ.get("OPENMOB_MAX_ACTIONS", "").strip().isdigit():
+        cfg.max_actions_per_turn = int(os.environ["OPENMOB_MAX_ACTIONS"])
+    if os.environ.get("OPENMOB_FORM_ACTIONS", "").strip().isdigit():
+        cfg.form_actions_per_turn = int(os.environ["OPENMOB_FORM_ACTIONS"])
+    if os.environ.get("OPENMOB_PARALLEL_OBSERVE", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.parallel_observe = os.environ["OPENMOB_PARALLEL_OBSERVE"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_REPLAY", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.replay_paths = os.environ["OPENMOB_REPLAY"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_MEMORY", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.memory = os.environ["OPENMOB_MEMORY"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_REPLAY_STORE_API", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.replay_store_api = os.environ["OPENMOB_REPLAY_STORE_API"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_PLAN_EXECUTE", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.plan_execute = os.environ["OPENMOB_PLAN_EXECUTE"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_DEEP_LINKS", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.deep_links = os.environ["OPENMOB_DEEP_LINKS"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_DEEP_LINKS_FAST", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.deep_links_fast = os.environ["OPENMOB_DEEP_LINKS_FAST"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_APP_LINKS", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.app_links = os.environ["OPENMOB_APP_LINKS"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_APP_LINKS_FAST", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.app_links_fast = os.environ["OPENMOB_APP_LINKS_FAST"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_SCROLL_SETTLE_S", "").strip():
+        cfg.scroll_settle_delay = float(os.environ["OPENMOB_SCROLL_SETTLE_S"])
+    if os.environ.get("OPENMOB_MODEL_TIMEOUT_S", "").strip():
+        cfg.model_timeout_s = float(os.environ["OPENMOB_MODEL_TIMEOUT_S"])
+        cfg.model_timeout_self_hosted = True  # set explicitly: it covers every provider
+    if os.environ.get("OPENMOB_ANSWER_CHECK", "").strip().lower() in ("on", "1", "true", "off", "0", "false"):
+        cfg.answer_check = os.environ["OPENMOB_ANSWER_CHECK"].strip().lower() in ("on", "1", "true")
+    if os.environ.get("OPENMOB_MODEL_RETRIES", "").strip().isdigit():
+        cfg.model_retries = int(os.environ["OPENMOB_MODEL_RETRIES"])
+    if cfg.model_timeout_s < 0 or cfg.model_timeout_long_s < 0 or cfg.model_retries < 0 or cfg.model_retry_max_wait_s < 0:
+        raise ValueError("model_timeout_s, model_timeout_long_s, model_retries and model_retry_max_wait_s can't be negative")
+    if os.environ.get("OPENMOB_CANVAS_EFFORT") is not None:
+        cfg.canvas_effort = os.environ["OPENMOB_CANVAS_EFFORT"].strip()
+    cfg.workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    cfg.jev_api_key = os.environ.get("TYPESAFE_API_KEY")
+    if os.environ.get("OPENMOB_JEV", "").strip().lower() in {"0", "off", "false", "no"}:
+        cfg.jev_enabled = False
+    if os.environ.get("OPENMOB_ADAPTIVE_SETTLE", "").strip().lower() in {"0", "off", "false", "no"}:
+        cfg.adaptive_settle = False
+    round_d = os.environ.get("OPENMOB_ROUND_D", "").strip().lower()
+    if round_d:  # all four round D features on or off at once (docs/benchmarks.md), for comparisons
+        on = round_d in {"1", "on", "true", "yes"}
+        cfg.fast_path_lazy_screenshot = cfg.jev_one_request = cfg.fast_path_direct_launch = cfg.fast_path_done = on
+    if os.environ.get("OPENMOB_LANDING_DONE", "").strip():
+        cfg.landing_done = os.environ["OPENMOB_LANDING_DONE"].strip().lower() in {"1", "on", "true", "yes"}
+    if os.environ.get("OPENMOB_FAST_DONE", "").strip():
+        cfg.fast_path_done = os.environ["OPENMOB_FAST_DONE"].strip().lower() in {"1", "on", "true", "yes"}
+    if os.environ.get("OPENMOB_MIN_APP_VERSION", "").strip():
+        raw = os.environ["OPENMOB_MIN_APP_VERSION"].strip()
+        if not raw.isdigit():
+            raise ValueError("OPENMOB_MIN_APP_VERSION must be a whole number (0: no minimum)")
+        cfg.min_app_version = int(raw)
+    if isinstance(cfg.min_app_version, bool) or not isinstance(cfg.min_app_version, int) or cfg.min_app_version < 0:
+        raise ValueError("min_app_version must be a whole number, 0 or more (0: no minimum)")
+    if os.environ.get("OPENMOB_INVITE_EMAIL", "").strip():
+        cfg.invite_email = os.environ["OPENMOB_INVITE_EMAIL"]
+    cfg.invite_email = check_invite_email(cfg.invite_email)
+    if os.environ.get("OPENMOB_SETTLE_QUIET_MS", "").strip():
+        cfg.settle_quiet_ms = int(os.environ["OPENMOB_SETTLE_QUIET_MS"])
+    if os.environ.get("OPENMOB_FAST_PATH", "").strip():
+        cfg.fast_path = os.environ["OPENMOB_FAST_PATH"].strip().lower()
+    cfg.openai_api_key = os.environ.get("OPENAI_API_KEY")
+    cfg.google_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    cfg.qwen_api_key = os.environ.get("QWEN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
+    cfg.xai_api_key = os.environ.get("XAI_API_KEY")
+    cfg.qwen_base_url = os.environ.get("QWEN_BASE_URL", cfg.qwen_base_url)
+    cfg.xai_base_url = os.environ.get("XAI_BASE_URL", cfg.xai_base_url)
+    cfg.compatible_api_key = os.environ.get("OPENAI_COMPATIBLE_API_KEY")
+    cfg.openai_compatible_base_url = os.environ.get("OPENAI_COMPATIBLE_BASE_URL", cfg.openai_compatible_base_url)
+    cfg.adb_serial = os.environ.get("ANDROID_SERIAL", cfg.adb_serial)
+    cfg.source = source
+    cfg.models = [normalize_model(m) for m in cfg.models or []]
+    if cfg.model not in {m["id"] for m in cfg.models}:  # the default is always selectable
+        cfg.models.insert(0, normalize_model(cfg.model))
+    if cfg.confirm_actions not in {"unrequested", "always", "never"}:
+        raise ValueError("confirm_actions must be one of: unrequested, always, never")
+    if cfg.default_permission_mode not in ("ask", "plan", "auto"):
+        raise ValueError("default_permission_mode must be one of: ask, plan, auto")
+    if cfg.api_default_tier not in cfg.api_tiers:
+        raise ValueError(f"api_default_tier must be one of: {', '.join(cfg.api_tiers)}")
+    for name, tier in cfg.api_tiers.items():
+        if not isinstance(tier, dict) or "model" not in tier:
+            raise ValueError(f"api_tiers.{name} needs a model")
+        tier.setdefault("credits_per_step", 1)
+        # A tier may name any provider's model; one that isn't in `models:` needs a known provider.
+        if tier["model"] not in {m["id"] for m in cfg.models}:
+            provider = tier.get("provider") or infer_provider(str(tier["model"]))
+            if provider not in PROVIDERS:
+                raise ValueError(f"api_tiers.{name}: say which provider serves {tier['model']} (provider: ...)")
+            tier["provider"] = provider
+    if isinstance(cfg.fast_path, bool):  # YAML reads a bare off / on as a boolean
+        cfg.fast_path = "on" if cfg.fast_path else "off"
+    if cfg.fast_path not in FAST_PATH_MODES:
+        raise ValueError(f"fast_path must be one of: {', '.join(FAST_PATH_MODES)}")
+    if cfg.history_trim not in {"batch", "rolling"}:
+        raise ValueError("history_trim must be one of: batch, rolling")
+    if cfg.ui_tree not in {"auto", "always", "never"}:
+        raise ValueError("ui_tree must be one of: auto, always, never")
+    if cfg.faster_mode not in FASTER_MODE_VALUES:
+        raise ValueError("faster_mode must be one of: " + ", ".join(FASTER_MODE_VALUES) + ". Only a phone's owner "
+                         "can turn Faster mode on, in the OpenMob app on that phone.")
+    if not str(cfg.jev_image_model).startswith("jev-") or cfg.jev_image_model in ("jev-latest", "jev-preview"):
+        raise ValueError("jev_image_model must name an exact Jev version (e.g. jev-1.14.0), not a moving alias.")
+    from .jev import IMAGE_STATES, ROUTINE_TARGETS
+
+    if float(cfg.jev_tap_min_box) < 0.5:
+        raise ValueError("jev_tap_min_box can't be below 0.5 (the safe tap rule the 2026-10-17 benchmark measured).")
+    if not 0 < float(cfg.jev_tap_min_probability) <= 1 or not 0 < float(cfg.jev_tap_min_confidence) <= 1:
+        raise ValueError("jev_tap_min_probability and jev_tap_min_confidence must be in (0, 1].")
+    if any(a not in ROUTINE_TARGETS for a in cfg.jev_tap_actions):
+        raise ValueError("jev_tap_actions: only " + ", ".join(ROUTINE_TARGETS))
+    if any(s not in IMAGE_STATES or s in ("loading", "login", "home_screen") for s in cfg.jev_tap_states):
+        raise ValueError("jev_tap_states: only menu, content, game_over, dialog")
+    prompts = dict(PERMISSION_DEFAULTS)
+    for kind, value in (cfg.permission_prompts or {}).items():
+        if kind not in PERMISSION_DEFAULTS or value not in permission_values(kind):
+            raise ValueError(f"permission_prompts.{kind}: one of {', '.join(permission_values(kind))}"
+                             if kind in PERMISSION_DEFAULTS else
+                             f"permission_prompts: unknown type {kind!r} (one of {', '.join(PERMISSION_DEFAULTS)})")
+        prompts[kind] = value
+    cfg.permission_prompts = prompts
+    return cfg

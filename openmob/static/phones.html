@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your Phones · OpenMob</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:wght@600&display=swap" rel="stylesheet">
+<script>try { const t = localStorage.getItem("openmob.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+<link rel="stylesheet" href="/static/ds.css">
+<style>
+  /* ---------- your phones ---------- */
+  .wrap { max-width: 720px; }
+  .phones { list-style: none; margin: 0; padding: 0; }
+  .phones li { display: flex; align-items: center; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .phones li:last-child { border-bottom: 0; }
+  .phones .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+  .phones .dot.on { background: var(--ok); }
+  .phones .info { flex: 1; min-width: 180px; }
+  .phones .name { font-weight: 600; overflow-wrap: anywhere; }
+  .phones .meta { color: var(--muted); font-size: 13px; }
+  .phones li.empty { color: var(--muted); font-size: 14px; }
+  .note { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .prompts { margin-top: 28px; }
+  .prompts .grid { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(150px, 1.4fr); gap: 8px 14px; align-items: center; margin: 12px 0; }
+  .prompts select { width: 100%; }
+  .head-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="6.5" y="2.5" width="11" height="19" rx="3"/><path d="M10.5 18h3"/></svg></span>OpenMob<span class="page-name">Your phones</span></a>
+  <nav class="topnav"><a class="btn btn-ghost" href="/">← Dashboard</a></nav>
+</header>
+<main class="page wrap">
+  <div class="card">
+    <div class="head-row">
+      <div class="page-head" style="margin:0">
+        <h1>Your phones</h1>
+        <p>Every phone paired to your account, connected or not. Remove one you don't recognise: it disconnects at once and can't reconnect without pairing again. A phone added after your first can approve only its own actions until you trust it.</p>
+      </div>
+      <a class="btn btn-primary" href="/connect">Connect a phone</a>
+    </div>
+    <ul class="phones" id="phones" aria-live="polite"><li class="empty">Loading…</li></ul>
+    <p class="error" id="err" role="alert"></p>
+    <p class="note">Each pairing and removal is recorded in your account's log (Developer › Logs).</p>
+    <section class="prompts" aria-labelledby="promptsTitle">
+      <h2 id="promptsTitle">Permission prompts</h2>
+      <p class="note">When the app a task is using asks for a permission ("Allow Kalshi to use your location?"), the agent answers by these settings with no prompt: by default "Only this time" (or the narrowest grant the dialog offers), notifications allowed, location approximate. Never "Allow all the time". Another app's request asks you on the phone. Allowing more (While using the app, Precise) needs your approval on that phone, with its screen lock; tightening is immediate.</p>
+      <label class="note" for="promptPhone">Phone</label>
+      <select id="promptPhone"><option value="">Choose an online phone…</option></select>
+      <div class="grid" id="promptRows"></div>
+      <button class="btn btn-primary" type="button" id="promptSave" hidden>Save</button>
+      <p class="note" id="promptMsg" role="status"></p>
+    </section>
+    <section class="prompts" aria-labelledby="blockedTitle">
+      <h2 id="blockedTitle">Blocked apps</h2>
+      <p class="note">Agents can't open or act in these apps on the phone, in any mode. The phone keeps and enforces this list; what you see here is a copy from its last connection. Built in on every phone and never removable: banking and payments, wallets and crypto, passwords and sign-in codes, and OpenMob itself.</p>
+      <label class="note" for="blockedPhone">Phone</label>
+      <select id="blockedPhone"><option value="">Choose a phone…</option></select>
+      <ul class="phones" id="blockedList" aria-live="polite"></ul>
+      <p class="note"><strong>To unblock an app</strong>, open OpenMob on the phone: Settings › Blocked apps. It asks for the phone's screen lock. Nobody can unblock an app from here.</p>
+      <form id="blockForm" hidden>
+        <label class="note" for="blockPkg">Block another app (its package name, like org.thoughtcrime.securesms)</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input id="blockPkg" type="text" autocomplete="off" spellcheck="false" style="flex:1 1 240px" placeholder="com.example.app">
+          <button class="btn btn-primary" type="submit">Block on phone</button>
+        </div>
+        <p class="note">The request goes to the phone, which adds the block now if it's connected, or when it next connects. Blocking never needs the screen lock.</p>
+      </form>
+      <p class="note" id="blockedMsg" role="status"></p>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+
+function ago(t) {
+  if (!t) return "never";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return new Date(t * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  if (res.status === 401) { location.href = "/login?next=" + encodeURIComponent(location.pathname); throw new Error("Signed out."); }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+  return res.json();
+}
+
+async function remove(d, btn) {
+  btn.disabled = true;
+  try { await api(`/api/devices/${encodeURIComponent(d.id)}/revoke`, { method: "POST" }); $("err").textContent = ""; }
+  catch (e) { $("err").textContent = e.message; btn.disabled = false; }
+  load();
+}
+
+// Review 5 H1: creating or rotating an API key and trusting a phone ask for the account's password again (the
+// sign-in cookie alone could be an agent driving the phone's browser). A small dialog; null when cancelled.
+function askPassword(title) {
+  return new Promise((resolve) => {
+    const make = (tag, props) => Object.assign(document.createElement(tag), props || {});
+    const d = make("dialog");
+    d.setAttribute("aria-label", title);
+    d.style.cssText = "border:1px solid var(--line, #d0d5dd);border-radius:12px;padding:16px;width:min(360px, calc(100vw - 32px));background:var(--bg, #fff);color:var(--fg, #111)";
+    const f = make("form", { autocomplete: "off" });
+    const p = make("p", { textContent: title });
+    p.style.margin = "0 0 8px";
+    // Not a sign-in field: "new-password" keeps the browser from filling it from saved passwords (an agent driving
+    // the phone's browser could otherwise confirm with one tap). It stays type=password so Android treats it as a
+    // password (hidden from accessibility services and the keyboard's learning).
+    const input = make("input", { type: "password", name: "openmob-confirm", autocomplete: "new-password",
+                                  className: "input", required: true, placeholder: "Your OpenMob password", spellcheck: false, autocapitalize: "off" });
+    input.setAttribute("data-lpignore", "true"); // password-manager extensions too
+    input.setAttribute("data-1p-ignore", "");
+    input.setAttribute("aria-label", "Your OpenMob password");
+    input.style.width = "100%";
+    const row = make("div");
+    row.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:12px";
+    const cancel = make("button", { type: "button", className: "btn btn-sm", textContent: "Cancel" });
+    const ok = make("button", { type: "submit", className: "btn btn-sm btn-primary", textContent: "Confirm" });
+    row.append(cancel, ok);
+    f.append(p, input, row);
+    d.append(f);
+    document.body.append(d);
+    const done = (value) => { if (d.open) d.close(); d.remove(); resolve(value); };
+    cancel.onclick = () => done(null);
+    d.addEventListener("cancel", (e) => { e.preventDefault(); done(null); });
+    f.onsubmit = (e) => { e.preventDefault(); done(input.value); };
+    d.showModal();
+    input.focus();
+  });
+}
+
+async function trust(d, btn) {
+  const password = await askPassword("Enter your OpenMob password to trust this phone for approvals.");
+  if (password === null) return;
+  btn.disabled = true;
+  try { await api(`/api/devices/${encodeURIComponent(d.id)}/trust`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }) }); $("err").textContent = ""; }
+  catch (e) { $("err").textContent = e.message; btn.disabled = false; }
+  load();
+}
+
+async function load() {
+  try {
+    const phones = (await api("/api/devices")).filter((d) => d.connection === "app");
+    $("phones").replaceChildren(...(phones.length ? phones.map((d) => {
+      const li = el("li");
+      const info = el("div", "info");
+      info.append(el("div", "name", d.name || d.model),
+                  el("div", "meta", `${d.online ? "Online" : `Offline · last seen ${ago(d.last_seen)}`} · paired ${ago(d.paired_at)}` +
+                     (d.trusted_for_approvals === false ? " · can approve only its own actions" : "") +
+                     // The app version it connected with (live phones only), and whether it must update to act.
+                     (d.app_version_code ? ` · app ${d.app_version_code}` : "") +
+                     (d.app_update_required ? " · update needed: it can't run tasks until the app is updated" : "")));
+      const btn = el("button", "btn btn-sm btn-danger", "Remove");
+      btn.type = "button";
+      btn.setAttribute("aria-label", `Remove ${d.name || d.model} from your account`);
+      btn.onclick = () => remove(d, btn);
+      li.append(Object.assign(el("span", `dot ${d.online ? "on" : ""}`), { title: d.online ? "Online" : "Offline" }), info);
+      if (d.trusted_for_approvals === false) {
+        const t = el("button", "btn btn-sm btn-primary", "Trust for approvals");
+        t.type = "button";
+        t.title = "Let this phone approve risky actions on your other phones too";
+        t.onclick = () => trust(d, t);
+        li.append(t);
+      }
+      li.append(btn);
+      return li;
+    }) : [el("li", "empty", "No phones paired yet.")]));
+  } catch (e) { $("err").textContent = e.message; }
+}
+const PROMPT_TYPES = [
+  ["notifications", "Notifications", [["deny", "Don't allow"], ["allow", "Allow"]]],
+  ["location", "Location", null], ["location_accuracy", "Location accuracy", [["approximate", "Approximate"], ["precise", "Precise"]]],
+  ["camera", "Camera", null], ["microphone", "Microphone", null], ["contacts", "Contacts", null],
+  ["photos", "Photos and media", null], ["phone", "Phone calls", null], ["sms", "Text messages", null],
+  ["calendar", "Calendar", null], ["nearby_devices", "Nearby devices", null],
+  ["physical_activity", "Physical activity", null], ["body_sensors", "Body sensors", null],
+];
+const GRANTS = [["ask", "Ask me"], ["once", "Only this time"], ["while_using", "While using the app"], ["deny", "Don't allow"]];
+let promptSettings = null;
+
+async function loadPrompts() {
+  const id = $("promptPhone").value;
+  $("promptRows").replaceChildren();
+  $("promptSave").hidden = true;
+  $("promptMsg").textContent = "";
+  if (!id) return;
+  try {
+    const view = await api(`/api/devices/${encodeURIComponent(id)}/permissions`);
+    promptSettings = view.permission_prompts || {};
+    for (const [key, label, options] of PROMPT_TYPES) {
+      const sel = el("select");
+      sel.id = `prompt-${key}`;
+      for (const [value, text] of options || GRANTS) sel.append(Object.assign(el("option", "", text), { value }));
+      sel.value = promptSettings[key] || (options ? options[0][0] : "once");
+      const lab = el("label", "", label);
+      lab.htmlFor = sel.id;
+      $("promptRows").append(lab, sel);
+    }
+    $("promptSave").hidden = false;
+  } catch (e) { $("promptMsg").textContent = e.message; }
+}
+
+async function savePrompts() {
+  const id = $("promptPhone").value;
+  const changed = {};
+  for (const [key] of PROMPT_TYPES) {
+    const v = $(`prompt-${key}`).value;
+    if (v !== promptSettings[key]) changed[key] = v;
+  }
+  if (!Object.keys(changed).length) { $("promptMsg").textContent = "Nothing changed."; return; }
+  try {
+    const res = await fetch(`/api/devices/${encodeURIComponent(id)}/permissions`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ permission_prompts: changed }) });
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 202) $("promptMsg").textContent = "Approve this on the phone, with its screen lock. It applies once you do.";
+    else if (res.ok) { $("promptMsg").textContent = "Saved."; promptSettings = body.settings?.permission_prompts || promptSettings; }
+    else $("promptMsg").textContent = body.detail || res.statusText;
+  } catch (e) { $("promptMsg").textContent = e.message; }
+}
+
+async function promptPhones() {
+  try {
+    const online = (await api("/api/devices")).filter((d) => d.connection === "app" && d.online);
+    const sel = $("promptPhone");
+    const keep = sel.value;
+    sel.replaceChildren(Object.assign(el("option", "", online.length ? "Choose an online phone…" : "No phone online"), { value: "" }),
+      ...online.map((d) => Object.assign(el("option", "", d.name || d.model), { value: d.id })));
+    if (online.some((d) => d.id === keep)) sel.value = keep;
+    else if (keep) loadPrompts();
+  } catch (e) { /* the list above shows the error */ }
+}
+$("promptPhone").onchange = loadPrompts;
+$("promptSave").onclick = savePrompts;
+
+// --- blocked apps (docs/design/blocked-apps.md): the phone's copy, and "block another app" (add only) ---
+async function loadBlocked() {
+  const id = $("blockedPhone").value;
+  $("blockForm").hidden = !id;
+  if (!id) { $("blockedList").replaceChildren(); return; }
+  try {
+    const view = await api(`/api/devices/${encodeURIComponent(id)}/blocked-apps`);
+    // The phone's name for each app, its package in small mono text beneath (matching is by package only).
+    const row = (name, pkg, note) => {
+      const li = el("li");
+      const info = el("div", "info");
+      info.append(el("div", "name", name || pkg));
+      if (name) { const m = el("div", "meta", pkg); m.style.fontFamily = "var(--mono, monospace)"; info.append(m); }
+      if (note) info.append(el("div", "meta", note));
+      li.append(info);
+      return li;
+    };
+    const apps = view.apps || view.packages.map((p) => ({ package: p, label: "" }));
+    const rows = apps.map((a) => row(a.label, a.package));
+    rows.push(...view.pending.map((p) => row("", p, "Requested here: the phone adds it when it next connects")));
+    if (!rows.length) rows.push(el("li", "empty", "No apps added on this phone."));
+    $("blockedList").replaceChildren(...rows);
+    $("blockedMsg").textContent = view.reported_at ? `Last reported by the phone ${ago(view.reported_at)}.` : "The phone hasn't reported its list yet.";
+  } catch (e) { $("blockedMsg").textContent = e.message; }
+}
+
+async function blockedPhones() {
+  try {
+    const phones = (await api("/api/devices")).filter((d) => d.connection === "app" && d.session !== false);
+    const sel = $("blockedPhone");
+    const keep = sel.value;
+    sel.replaceChildren(Object.assign(el("option", "", phones.length ? "Choose a phone…" : "No phone connected since the server started"), { value: "" }),
+      ...phones.map((d) => Object.assign(el("option", "", d.name || d.model), { value: d.id })));
+    if (phones.some((d) => d.id === keep)) sel.value = keep;
+  } catch (e) { /* the list above shows the error */ }
+}
+
+$("blockedPhone").onchange = loadBlocked;
+$("blockForm").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const id = $("blockedPhone").value;
+  const pkg = $("blockPkg").value.trim();
+  if (!id || !pkg) return;
+  try {
+    const res = await fetch(`/api/devices/${encodeURIComponent(id)}/blocked-apps`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ packages: [pkg] }) });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { $("blockedMsg").textContent = body.detail || res.statusText; return; }
+    $("blockPkg").value = "";
+    $("blockedMsg").textContent = body.online ? "Sent to the phone." : "The phone adds it when it next connects.";
+    setTimeout(loadBlocked, 800);
+  } catch (e) { $("blockedMsg").textContent = e.message; }
+};
+
+load();
+promptPhones();
+blockedPhones();
+setInterval(() => { load(); promptPhones(); blockedPhones(); }, 5000);
+</script>
+</body>
+</html>

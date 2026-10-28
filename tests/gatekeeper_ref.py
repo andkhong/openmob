@@ -1,0 +1,3208 @@
+"""Reference implementation of the phone gatekeeper's policy engine (docs/design/phone-gatekeeper.md, Phase 1).
+
+The phone runs the Kotlin engine (android/app/src/main/java/dev/openmob/companion/gate/). This module is the
+same engine in Python, reading the same rule file (android/app/src/main/resources/gatekeeper/rules.json), so
+the server-side tests can put a *simulated gatekeeper phone* in front of a fake compromised server. Both
+implementations run the shared scenario fixtures (tests/fixtures/gatekeeper/*.json): pytest through this
+module (test_gatekeeper_conformance.py), and JUnit through the Kotlin engine (GateScenarioTest.kt). A fixture
+that passes in one and fails in the other is a divergence, and fails CI.
+
+Nothing in the server imports this: the phone is the enforcement point.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import unicodedata
+import uuid
+from dataclasses import dataclass, field, replace as dc_replace
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RULES_PATH = ROOT / "android/app/src/main/resources/gatekeeper/rules.json"
+
+
+def _settings_pages() -> dict:
+    """The server's copy of the phone's open_settings table (key -> page with action, title, tier, needs_package)."""
+    import sys
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from openmob.phone.settings_pages import PAGES
+
+    return PAGES
+MODES = {"ask": 0, "plan": 1, "auto": 1, "trusted": 2, "never": 3}
+ACTION_PARAMS = ("x", "y", "x1", "y1", "x2", "y2", "duration_ms", "text", "replace", "name", "package", "url", "page")
+
+
+# --- text ---------------------------------------------------------------------------------------
+
+def norm(text: str | None) -> str:
+    """NFKD, diacritics stripped, lower-cased."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).lower()
+
+
+def tokens(text: str | None) -> list[str]:
+    return [t for t in re.split(r"[\W_]+", norm(text)) if t]
+
+
+def id_tokens(resource_id: str | None) -> list[str]:
+    """A resource id as words: "com.x:id/buyNowButton" -> [buy, now, button]."""
+    rid = (resource_id or "").rsplit("/", 1)[-1]
+    rid = re.sub(r"([a-z])([A-Z])", r"\1 \2", rid)
+    return tokens(rid)
+
+
+def has_phrase(toks: list[str], phrase: str) -> bool:
+    p = tokens(phrase)
+    if not p:
+        return False
+    n = len(p)
+    return any(toks[i:i + n] == p for i in range(len(toks) - n + 1))
+
+
+def strip_phrases(toks: list[str], phrases: list[str]) -> list[str]:
+    """The tokens with every occurrence of the phrases removed (longest first)."""
+    out = list(toks)
+    for phrase in sorted(phrases, key=lambda s: -len(tokens(s))):
+        p = tokens(phrase)
+        n = len(p)
+        i = 0
+        while i <= len(out) - n and n:
+            if out[i:i + n] == p:
+                del out[i:i + n]
+            else:
+                i += 1
+    return out
+
+
+def any_phrase(toks: list[str], phrases: list[str]) -> str | None:
+    for phrase in phrases:
+        if has_phrase(toks, phrase):
+            return phrase
+    return None
+
+
+VOLATILE = re.compile(r"\d+(?:[.,:]\d+)*")
+AMOUNT = re.compile(r"[$€£¥₹]\s?\d+(?:[.,]\d+)*|\d+(?:[.,]\d+)*\s?[¢€$£]")
+MONEY_LABELS = ["total", "cost", "price", "amount", "subtotal", "you pay", "pay", "order total", "payout"]
+
+
+def vol(text: str | None) -> str:
+    """A label with its volatile numbers (odds, prices, counts, times) blanked: the same element across reads."""
+    return VOLATILE.sub("#", text or "")
+
+
+def amounts(text: str | None) -> list[str]:
+    return [re.sub(r"\s+", "", a) for a in AMOUNT.findall(text or "")]
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+# --- rules --------------------------------------------------------------------------------------
+
+class Rules:
+    def __init__(self, data: dict):
+        self.d = data
+        self.meta = set(data["methods"]["meta"])
+        self.read = set(data["methods"]["read"])
+        self.act = set(data["methods"]["act"])
+        self.own = set(data["own_packages"])
+        self.sensitive = [re.compile(p) for p in data["sensitive_apps"]]
+        self.installers = set(data["installer_packages"])
+        self.money_app = re.compile(data["money_app"])
+        self.cat = {k: re.compile(v) for k, v in data["categories"].items()}
+        self.w = data["words"]
+        s = data["settings"]
+        self.settings_pkg = re.compile(s["packages"])
+        self.s = s
+        self.surf = data["surfaces"]
+        self.limits = data["limits"]
+        self.lexicon = set(data["language"]["lexicon"].split())
+        self.ssn_label = re.compile(data["sensitive_numbers"]["ssn_label"])
+
+    @classmethod
+    def load(cls) -> "Rules":
+        return cls(json.loads(RULES_PATH.read_text()))
+
+    def rx(self, key: str) -> re.Pattern:
+        return re.compile(self.d[key])
+
+    def blocked(self, package: str | None) -> bool:
+        p = (package or "").lower()
+        return bool(p) and any(r.search(p) for r in self.sensitive)
+
+    def is_cat(self, cat: str, package: str | None) -> bool:
+        return bool(package) and bool(self.cat[cat].search(package))
+
+
+# --- screen model -------------------------------------------------------------------------------
+
+@dataclass
+class Node:
+    text: str = ""
+    desc: str = ""
+    id: str = ""
+    cls: str = ""
+    bounds: tuple = (0, 0, 0, 0)
+    clickable: bool = False
+    long_clickable: bool = False
+    editable: bool = False
+    password: bool = False
+    hint: str = ""
+    checked: bool | None = None
+    focused: bool = False
+    truncated: bool = False  # the phone stopped reading below this node (its children aren't all here)
+    # Which way its content can scroll right now ("up", "down", "left", "right"): accessibility's scroll actions on a
+    # scrollable node (GateScreens.scrollDirs). Empty: it can't scroll, whatever its class.
+    scroll: tuple = ()
+    # A text field's selection (the cursor when both are equal); -1: not reported. Typing inserts there (TypedText).
+    sel_start: int = -1
+    sel_end: int = -1
+    children: list = field(default_factory=list)
+
+    @classmethod
+    def of(cls, d: dict) -> "Node":
+        return cls(text=d.get("text", ""), desc=d.get("desc", ""), id=d.get("id", ""), cls=d.get("cls", ""),
+                   bounds=tuple(d.get("bounds", (0, 0, 0, 0))), clickable=bool(d.get("clickable")),
+                   long_clickable=bool(d.get("long_clickable")), editable=bool(d.get("editable")),
+                   password=bool(d.get("password")), hint=d.get("hint", ""), checked=d.get("checked"),
+                   focused=bool(d.get("focused")), truncated=bool(d.get("truncated")),
+                   scroll=tuple(d.get("scroll", ())), sel_start=int(d.get("sel_start", -1)),
+                   sel_end=int(d.get("sel_end", -1)), children=[Node.of(c) for c in d.get("children", [])])
+
+    def contains(self, x: float, y: float) -> bool:
+        l, t, r, b = self.bounds
+        return l <= x < r and t <= y < b
+
+    def fp(self, bounds: bool) -> str:
+        parts = [self.id, vol(self.text), vol(self.desc), self.cls]
+        if bounds:
+            parts.append(",".join(str(v) for v in self.bounds))
+        return "/".join(parts)
+
+
+@dataclass
+class Window:
+    id: int
+    type: str
+    layer: int
+    package: str
+    title: str
+    bounds: tuple
+    root: Node | None
+    since: int = 0  # when the phone first saw this window (uptime ms)
+
+    @classmethod
+    def of(cls, d: dict) -> "Window":
+        return cls(id=int(d.get("id", 0)), type=d.get("type", "application"), layer=int(d.get("layer", 0)),
+                   package=d.get("package", ""), title=d.get("title", ""),
+                   bounds=tuple(d.get("bounds", (0, 0, 1080, 2400))),
+                   root=Node.of(d["root"]) if d.get("root") else None, since=int(d.get("since", 0)))
+
+
+@dataclass
+class Screen:
+    windows: list
+    keyguard_locked: bool = False
+    keyguard_secure: bool = True
+    quiet_ms: int = 1000
+    activity: str = ""
+    autofill_service: str = ""
+    resolve: dict = field(default_factory=dict)
+    focus_expected: bool = False  # the phone has a live input focus (typing and ENTER go there)
+    focus: dict = field(default_factory=dict)  # that focus resolved directly: {window, node, ancestors}
+    available: bool = True  # the accessibility service is bound (else the phone can't see the screen at all)
+    event: dict = field(default_factory=dict)  # the last window-state event: {package, text}
+    owner: list = field(default_factory=list)  # the owner's own names (profile, paired account): "self" recipients
+    labels: dict = field(default_factory=dict)
+    # The phone's own OCR of a system dialog Android hides from accessibility (a permission dialog): text lines
+    # [{text, bounds, conf}]. None: not read (no such dialog, or OCR unavailable).
+    ocr: list | None = None
+    # The phone's touch slop (ViewConfiguration.getScaledTouchSlop, px; 0: unknown). The gate uses the larger of it and
+    # rules.json swipe.slop_px (review M1, 2026-10-17).
+    touch_slop: int = 0
+    # The phone's own OCR of the words drawn near a tap or swipe start on a canvas or drawn spot (review M3): lines
+    # [{text, bounds, conf}]. None: not read (OCR failed, timed out, or no canvas spot).
+    drawn: list | None = None
+
+    @classmethod
+    def of(cls, d: dict) -> "Screen":
+        kg = d.get("keyguard") or {}
+        return cls(windows=[Window.of(w) for w in d.get("windows", [])], keyguard_locked=bool(kg.get("locked")),
+                   keyguard_secure=bool(kg.get("secure", True)), quiet_ms=int(d.get("quiet_ms", 1000)),
+                   activity=d.get("activity", ""), autofill_service=d.get("autofill_service", ""),
+                   resolve=d.get("resolve", {}), labels=d.get("labels", {}),
+                   focus_expected=bool((d.get("focus") or {}).get("expected")),
+                   focus=d.get("focus") or {},
+                   available=d.get("accessibility", True) is not False, event=d.get("event") or {},  # {package, text, at}
+                   owner=list(d.get("owner") or []), ocr=d.get("ocr"), touch_slop=int(d.get("touch_slop", 0)),
+                   drawn=d.get("canvas_ocr"))
+
+    def ordered(self) -> list[Window]:
+        return sorted(self.windows, key=lambda w: -w.layer)
+
+
+def walk(node: Node | None, out: list, limit: int = 2000):
+    if node is None or len(out) >= limit:
+        return out
+    out.append(node)
+    for c in node.children:
+        walk(c, out, limit)
+    return out
+
+
+def contains(bounds, x, y) -> bool:
+    l, t, r, b = bounds
+    return l <= x < r and t <= y < b
+
+
+@dataclass
+class Target:
+    window: Window
+    path: list  # root .. deepest node containing the point
+
+    @property
+    def hit(self) -> Node | None:
+        return self.path[-1] if self.path else None
+
+    @property
+    def pressed(self) -> Node | None:
+        for n in reversed(self.path):
+            if n.clickable or n.long_clickable:
+                return n
+        return self.hit
+
+    def label_tokens(self) -> list[str]:
+        parts = []
+        pressed, hit = self.pressed, self.hit
+        if pressed is not None and (pressed.clickable or pressed.long_clickable):
+            for n in walk(pressed, [], 40):  # a button's label often sits in its children
+                parts += [n.text, n.desc]
+        elif pressed is not None:
+            parts += [pressed.text, pressed.desc]
+        if hit is not None and hit is not pressed:
+            parts += [hit.text, hit.desc]
+        return tokens(" ".join(p for p in parts if p))
+
+    def ids(self) -> list[str]:
+        out = []
+        for n in (self.pressed, self.hit):
+            if n is not None and n.id and n.id not in out:
+                out.append(n.id)
+        return out
+
+    def labeled(self) -> bool:
+        return bool(self.label_tokens() or self.ids())
+
+    def in_webview(self) -> bool:
+        return any("WebView" in n.cls for n in self.path)
+
+    def shown(self) -> str:
+        for n in (self.pressed, self.hit):
+            if n is not None and (n.text or n.desc):
+                return (n.text or n.desc).strip()
+        if self.pressed is not None:
+            for n in walk(self.pressed, [], 40):
+                if n.text or n.desc:
+                    return (n.text or n.desc).strip()
+        ids = self.ids()
+        return " ".join(id_tokens(ids[0])) if ids else ""
+
+    def fp(self, bounds: bool) -> str:
+        p, h = self.pressed, self.hit
+        return "|".join([str(self.window.id), self.window.package, p.fp(bounds) if p else "", h.fp(bounds) if h else ""])
+
+
+def targets_at(window: Window, x: float, y: float, limit: int = 60) -> list:
+    """Every clickable or labeled node under (x, y) in the window (below its root), with its path from the root, in
+    tree order: what a tap there could land on, whatever the views' drawing order (GateScreen.targetsAt)."""
+    out = []
+
+    def visit(n, path):
+        if len(out) >= limit:
+            return
+        p = path + [n]
+        if path and (n.clickable or n.long_clickable or n.text or n.desc):
+            out.append(Target(window, p))
+        for c in n.children:
+            if c.contains(x, y):
+                visit(c, p)
+
+    if window.root is not None and window.root.contains(x, y):
+        visit(window.root, [])
+    return out
+
+
+def own_overlay(rules: Rules, w: Window) -> bool:
+    """One of OpenMob's own accessibility overlays (keep-awake, the agent indicator's border and Stop pill)."""
+    return w.type == "accessibility_overlay" and w.package in rules.own
+
+
+def catches_touches(w: Window) -> bool:
+    """Only the indicator's Stop pill has a clickable node: the border and keep-awake are untouchable."""
+    return any(n.clickable or n.long_clickable for n in walk(w.root, []))
+
+
+def hit_test(rules: Rules, screen: Screen, x: float, y: float) -> Target | None:
+    """The window that catches a touch at (x, y), highest layer first, and the path to the deepest node there. Our
+    own untouchable overlays never catch touches; the Stop pill does (and a tap on it is refused)."""
+    for w in screen.ordered():
+        if own_overlay(rules, w) and not catches_touches(w):
+            continue
+        if not contains(w.bounds, x, y):
+            continue
+        path = []
+        node = w.root
+        while node is not None and node.contains(x, y):
+            path.append(node)
+            node = next((c for c in reversed(node.children) if c.contains(x, y)), None)
+        return Target(w, path)
+    return None
+
+
+def focused_field(screen: Screen) -> tuple[Window, Node, list] | None:
+    """The focused text input (the one type_text and ENTER go to) with its window and ancestors."""
+    for w in screen.ordered():
+        found = _find_focused(w.root, [])
+        if found:
+            return w, found[-1], found
+    # Not in the walked tree (e.g. a Jetpack Compose text field): the node the phone's live input focus resolves
+    # to, with its parent chain, counts if its window is one the phone listed.
+    f = screen.focus
+    if f.get("node") is not None:
+        w = next((x for x in screen.windows if x.id == int(f.get("window", -1))), None)
+        if w is not None:
+            node = Node.of(f["node"])
+            return w, node, [Node.of(a) for a in f.get("ancestors", [])] + [node]
+    return None
+
+
+def field_ref(w: Window, node: Node) -> str:
+    """Which field the gate judged: its window, bounds, id and class (GateScreen.fieldRef)."""
+    return f"{w.id}|{','.join(str(int(v)) for v in node.bounds)}|{node.id}|{node.cls}"
+
+
+def _find_focused(node: Node | None, path: list) -> list | None:
+    if node is None:
+        return None
+    path = path + [node]
+    if node.focused and (node.editable or node.password):
+        return path
+    for c in node.children:
+        if (r := _find_focused(c, path)) is not None:
+            return r
+    return None
+
+
+def screen_tokens(screen: Screen) -> list[str]:
+    parts = []
+    for w in screen.windows:
+        if w.type in ("application", "system"):
+            for n in walk(w.root, []):
+                parts += [n.text, n.desc]
+    return tokens(" ".join(p for p in parts if p))
+
+
+def screen_text(screen: Screen) -> str:
+    parts = []
+    for w in screen.windows:
+        for n in walk(w.root, []):
+            parts += [n.text, n.desc]
+    return " ".join(p for p in parts if p)
+
+
+def payment_context(rules: Rules, screen: Screen) -> bool:
+    field_rx = rules.rx("payment_field")
+    for w in screen.windows:
+        for n in walk(w.root, []):
+            if (n.editable or "EditText" in n.cls) and (field_rx.search(n.id or "") or field_rx.search(n.hint or "")):
+                return True
+    text = screen_text(screen)
+    if rules.rx("currency").search(text):
+        toks = tokens(text)
+        return any_phrase(toks, rules.d["payment_words"]) is not None
+    return False
+
+
+def language_covered(rules: Rules, screen: Screen) -> bool:
+    """Is the screen in a language the shipped lexicon covers? Judged by script (mostly non-Latin letters: no),
+    then by real words only: lower-case alphabetic words of 4+ letters. Ticker labels ("DUN · 42%", "YES 63¢"),
+    abbreviations and names don't count, so they never make a screen "uncovered"."""
+    text = " ".join(f"{n.text} {n.desc}" for w in screen.windows if w.type in ("application", "system")
+                    for n in walk(w.root, []))
+    letters = [c for c in norm(text) if c.isalpha()]
+    if len(letters) >= 20 and sum(1 for c in letters if not ("a" <= c <= "z")) / len(letters) >= 0.4:
+        return False
+    words = [norm(t) for t in re.split(r"[\W_\d]+", text) if len(t) >= 4 and t.isalpha() and t == t.lower()]
+    if len(words) < rules.d["language"]["min_tokens"]:
+        return True
+    known = sum(1 for t in words if t in rules.lexicon)
+    return known / len(words) >= rules.d["language"]["threshold"]
+
+
+def money_amounts(window: Window, target) -> list[str]:
+    """The currency amounts a money commit is about: in the target's own label, and on the window's total, cost,
+    price or amount lines. A permit for a money commit binds them: any change asks again."""
+    texts = []
+    if target is not None:
+        for n in ([target.pressed] if target.pressed is not None else []) + walk(target.pressed, [], 40)[1:] \
+                + ([target.hit] if target.hit is not None else []):
+            texts += [n.text, n.desc]
+    for n in walk(window.root, []):
+        line = f"{n.text} {n.desc}"
+        if amounts(line) and any_phrase(tokens(line), MONEY_LABELS):
+            texts.append(line)
+    return sorted(set(a for t in texts for a in amounts(t)))
+
+
+LINK = re.compile(r"(?i)https?://|www\.|youtu\.be/|\b[a-z0-9-]+\.(?:com|be|org|net|io|tv|app|co)/")
+
+
+def shares_link(rules: Rules, window: Window) -> bool:
+    """The share sheet shares a link or text with a link (its preview shows a URL), not a photo, file or contact."""
+    return any(LINK.search(f"{n.text} {n.desc}") for n in walk(window.root, []))
+
+
+def is_self(rules: Rules, label: list[str], screen: Screen) -> bool:
+    """A recipient that is the owner, for public-link shares only (the one place the owner accepted a label-based
+    exemption: a spoofed "self" can at most receive a public link). The owner's own names (the paired account), with
+    an optional "(You)" the apps add, or an app's self chat ("Note to self", "Message yourself", "Saved messages").
+    Nothing else ending in "you" counts."""
+    if not label:
+        return False
+    if any(label == tokens(p) for p in rules.w["self"]):
+        return True
+    names = [tokens(n) for n in screen.owner if tokens(n)]
+    return any(label == n or label == n + ["you"] for n in names)
+
+
+def row_label(t: "Target") -> list[str]:
+    """The words of the row a pressed button sits in (its siblings), without the button's own: who a "Send" next
+    to a name in an in-app share list sends to."""
+    if t.pressed is None or t.pressed not in t.path:
+        return []
+    i = t.path.index(t.pressed)
+    if i == 0:
+        return []
+    row = t.path[i - 1]
+    own = set(id(n) for n in walk(t.pressed, [], 40))
+    return tokens(" ".join(f"{n.text} {n.desc}" for n in walk(row, [], 60) if id(n) not in own))
+
+
+def priced(screen: Screen, window: Window) -> bool:
+    """A price or currency on the target's window, or a Google Play billing sheet on screen."""
+    if any(w.package == "com.android.vending" and w.type in ("application", "system") and w is not window
+           for w in screen.windows):
+        return True
+    return any(amounts(f"{n.text} {n.desc}") for n in walk(window.root, []))
+
+
+def page_title(window: Window) -> list[str]:
+    """What a Settings page calls itself: its window title, and headers near the top that aren't rows."""
+    parts = [window.title]
+    top = window.bounds[1] + (window.bounds[3] - window.bounds[1]) * 0.16
+
+    def visit(node: Node, clickable_above: bool):
+        inside = clickable_above or node.clickable
+        if not inside and not node.editable and node.bounds[1] < top and (node.text or node.desc):
+            parts.append(node.text or node.desc)
+        for c in node.children:
+            visit(c, inside)
+    if window.root is not None:
+        visit(window.root, False)
+    return tokens(" ".join(p for p in parts if p))
+
+
+def url_scheme(url: str) -> str | None:
+    url = re.sub(r"[\t\n\r]", "", url or "")
+    url = re.sub("^[\\x00-\\x20\\u00a0\\ufeff]+", "", url)
+    m = re.match(r"([A-Za-z][A-Za-z0-9+.\-]*):", url)
+    return m.group(1).lower() if m else None
+
+
+def looks_like_url(text: str | None) -> bool:
+    text = (text or "").strip()
+    if not text or " " in text:
+        return False
+    return url_scheme(text) is not None or bool(re.match(r"(www\.)?[\w-]+(\.[\w-]+)+(/|$|:\d)", text))
+
+
+# --- sensitive numbers (SensitiveNumbers.kt): card numbers and SSNs in typed text and links (F2, F3) -------------
+
+# Separators between digit groups (review L4, 2026-10-17): any whitespace (tab and newline included), zero-width and
+# other invisible format characters, or one of + - . / _ , : with at most one space on each side ("4111 - 1111").
+# Review 4 (L9): also the direction marks as invisible characters, and other dashes, "|" and "\u2022" as punctuation.
+_SN_WS = ("\t\n\x0b\x0c\r \x1c-\x1f\x85\xa0\u1680\u2000-\u200d\u2028\u2029\u202f\u205f\u2060\u3000\ufeff\xad"
+          "\u200e\u200f\u202a-\u202e\u2066-\u2069")
+_SN_DASHES = "\\-\u2010-\u2015\u2212"
+_SN_GAP = f"(?:[{_SN_WS}]?[+{_SN_DASHES}./_,:|\u2022][{_SN_WS}]?|[{_SN_WS}]+)"  # the punctuation form first
+_SN_RUN = re.compile(f"(?<![0-9])(?<![0-9]\\.)[0-9](?:{_SN_GAP}?[0-9])*")
+_SN_SEP = re.compile(_SN_GAP)
+_SN_SSN = re.compile(f"(?<![0-9{_SN_DASHES}.])([0-9]{{3}})((?:[{_SN_WS}]|[{_SN_WS}]?[{_SN_DASHES}.,:|\u2022][{_SN_WS}]?)?)"
+                     f"([0-9]{{2}})\\2([0-9]{{4}})(?![0-9]|[{_SN_DASHES}./,:][0-9])")
+_SN_QUERY = re.compile(r"[?&;]([^=&;#]*)=([^&;#]*)")
+_SN_NUMERIC = re.compile(r"^[0-9][0-9 +\-_]*$")
+
+
+def luhn(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d = d * 2 - 9 if d * 2 > 9 else d * 2
+        total += d
+    return total % 10 == 0
+
+
+def cards(text: str) -> list[str]:
+    """The card numbers in `text` (their digits). A run right after "+" is an international phone number unless it is
+    card-shaped: grouped with a 4-digit first group, or 16 or more digits (a phone number has at most 15)."""
+    out = []
+    for m in _SN_RUN.finditer(text):
+        groups = _SN_SEP.split(m.group())
+        plus = m.start() > 0 and text[m.start() - 1] == "+"
+        if plus and not ((len(groups) > 1 and len(groups[0]) == 4) or (len(groups) == 1 and len(groups[0]) >= 16)):
+            continue
+        total = 0
+        for k, g in enumerate(groups):
+            total += len(g)
+            if total > 19 or (k > 0 and (len(groups[0]) != 4 or len(g) < 3)):  # a date range's "-10-" ends it
+                break
+            if total < 13:
+                continue
+            digits = "".join(groups[:k + 1])
+            if digits[0] in "23456" and luhn(digits):
+                out.append(digits)
+            break
+    return out
+
+
+def has_card(text: str) -> bool:
+    return bool(cards(text))
+
+
+def ssns(text: str, labeled: bool) -> list[str]:
+    out = []
+    for m in _SN_SSN.finditer(text):
+        area, sep, group, serial = m.groups()
+        if labeled or (sep and area not in ("000", "666") and area[0] != "9" and group != "00"
+                       and serial != "0000"):
+            out.append(area + group + serial)
+    return out
+
+
+def has_ssn(text: str, labeled: bool) -> bool:
+    return bool(ssns(text, labeled))
+
+
+def sensitive_set(text: str | None, ssn_context: bool = False) -> set:
+    """Every card number and SSN in `text`, as (kind, digits): what typing adds to a field is what its result holds
+    that its old text didn't (review L2, 2026-10-17)."""
+    t = ascii_digits(unicodedata.normalize("NFKC", text or ""))
+    return {("card", d) for d in cards(t)} | {("ssn", d) for d in ssns(t, ssn_context)}
+
+
+def ascii_digits(text: str) -> str:
+    """Every Unicode decimal digit as its ASCII digit (SensitiveNumbers.asciiDigits; review L1)."""
+    return "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in text)
+
+
+def find_sensitive(text: str | None, ssn_context: bool = False, card_field: bool = False) -> str | None:
+    t = ascii_digits(unicodedata.normalize("NFKC", text or ""))
+    if has_card(t):
+        return "card"
+    if has_ssn(t, ssn_context):
+        return "ssn"
+    if card_field and len(re.findall(r"[0-9]", t)) >= 3:
+        return "card"
+    return None
+
+
+def _unquote(s: str) -> str:
+    """Valid %XX runs become UTF-8 (malformed bytes replaced); everything else stays."""
+    out, i = [], 0
+    hexd = "0123456789abcdefABCDEF"
+    while i < len(s):
+        if s[i] == "%" and i + 2 < len(s) and s[i + 1] in hexd and s[i + 2] in hexd:
+            buf = bytearray()
+            while i + 2 < len(s) and s[i] == "%" and s[i + 1] in hexd and s[i + 2] in hexd:
+                buf.append(int(s[i + 1:i + 3], 16))
+                i += 3
+            out.append(buf.decode("utf-8", "replace"))
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def decode_url(url: str | None) -> str:
+    text = url or ""
+    for _ in range(10):
+        decoded = _unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    return unicodedata.normalize("NFKC", text)
+
+
+def split_card(text: str) -> bool:
+    """A card number split over consecutive numeric query parameters, each 3-12 digits, no decimals (SensitiveNumbers.splitCard)."""
+    pieces = []
+    for _, value in _SN_QUERY.findall(text):
+        v = value.strip()
+        digits = "".join(ch for ch in v if "0" <= ch <= "9")
+        pieces.append(digits if _SN_NUMERIC.match(v) and 3 <= len(digits) <= 12 else None)
+    for i, first in enumerate(pieces):
+        if first is None:
+            continue
+        joined = first
+        for nxt in pieces[i + 1:]:
+            if nxt is None:
+                break
+            joined += nxt
+            if len(joined) > 19:
+                break
+            if len(joined) >= 13 and joined[0] in "23456" and luhn(joined):
+                return True
+    return False
+
+
+def sensitive_in_url(url: str | None, ssn_label: re.Pattern) -> str | None:
+    text = decode_url(url)
+    found = find_sensitive(text, ssn_context=bool(ssn_label.search(text)))
+    if found is None and split_card(text):
+        return "card"
+    return found
+
+
+def describe_sensitive(kind: str | None) -> str:
+    return {"card": "a card number", "ssn": "a Social Security number"}.get(kind or "", "a sensitive number")
+
+
+NUMBER_PARAMS = ("x", "y", "x1", "y1", "x2", "y2", "duration_ms")
+FLAG_PARAMS = ("replace",)
+
+
+def bad_params(params: dict) -> str | None:
+    """Why an act's parameters can't be judged (review L3, 2026-10-17), or None. Coordinates and durations must be
+    finite JSON numbers (never a string such as "NaN", which the gate and the phone read differently), a duration
+    can't be negative, and flags must be true or false."""
+    import math
+
+    for k in NUMBER_PARAMS:
+        v = params.get(k)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            return f"Parameter '{k}' must be a finite number."
+        if k == "duration_ms" and v < 0:
+            return "Parameter 'duration_ms' can't be negative."
+    for k in FLAG_PARAMS:
+        v = params.get(k)
+        if v is not None and not isinstance(v, bool):
+            return f"Parameter '{k}' must be true or false."
+    return None
+
+
+def typed_result(old: str, sel_start: int, sel_end: int, text: str, replace: bool) -> str:
+    """What a field holds after type_text (TypedText.result on the phone): `text` inserted at the selection,
+    replacing it (none reported: appended), or `text` alone with `replace`."""
+    if replace:
+        return text
+    if sel_start < 0 or sel_end < 0:
+        return old + text
+    a, b = min(sel_start, sel_end), max(sel_start, sel_end)
+    a, b = min(a, len(old)), min(b, len(old))
+    return old[:a] + text + old[b:]
+
+
+def scrolls_away(path: list, x1, y1, x2, y2) -> bool:
+    """Something on `path` can really scroll the way a mostly straight drag goes (a finger moving up scrolls the
+    content down; moving left, right): it takes the touch, so nothing under the finger is pressed (review H1)."""
+    dx, dy = x2 - x1, y2 - y1
+    if abs(dy) >= 2 * abs(dx):
+        need = "down" if dy < 0 else "up"
+    elif abs(dx) >= 2 * abs(dy):
+        need = "right" if dx < 0 else "left"
+    else:
+        return False
+    return any(need in n.scroll for n in path)
+
+
+def drawn_payment(r, text: str) -> bool:
+    """Drawn words that make a payment context: a currency amount and a payment word (paymentContext's text rule)."""
+    if not re.search(r.d["currency"], text or ""):
+        return False
+    return any_phrase(tokens(text), r.d["payment_words"]) is not None
+
+
+def binding(method: str, params: dict, fp: str) -> str:
+    parts = []
+    for k in ACTION_PARAMS:
+        if k in params and params[k] is not None:
+            v = params[k]
+            if isinstance(v, bool):
+                v = "true" if v else "false"
+            elif isinstance(v, (int, float)):
+                v = str(int(round(v)))
+            parts.append(f"{k}={v}")
+    return sha256(f"gk1-action|{method}|{'&'.join(parts)}|{fp}")
+
+
+# --- decisions ----------------------------------------------------------------------------------
+
+@dataclass
+class Risk:
+    kind: str  # pay | send | post | delete | share | settings | fill | other | step
+    reason: str
+    money: str | None = None  # start | terminal
+    always: bool = False  # in the "always asks" class: refused under never
+    grant: str | None = None  # the grant binding ("Always allow" offered), or None
+    wording: str = ""
+
+
+@dataclass
+class Judgement:
+    refuse: tuple | None = None  # (code, rule, message)
+    package: str = ""
+    fp: str = ""
+    strict_fp: str = ""
+    risk: Risk | None = None
+    changing: bool = False
+    payment: bool = False
+    app: bool = False  # the target is an app window (an app switch ends a purchase flow)
+    label: list = field(default_factory=list)  # the target's words (a cart or checkout word ends a purchase flow)
+    money_fp: str = ""  # strict_fp plus the currency amounts a money commit is about (any change voids a permit)
+    wording: str = ""  # how a prompt names this action from what the phone sees (a deep link names its page)
+    field_ref: str = ""  # type_text, ENTER, DELETE: the field the gate judged (window, bounds, id, class)
+    install_title: str | None = None  # a Play Store Install/Get tap: the page's app title; None: not an install
+
+
+@dataclass
+class Admission:
+    decision: str  # allow | refuse | ask | redact
+    code: str = ""
+    rule: str = ""
+    message: str = ""
+    kind: str = ""
+    package: str = ""
+    approval_id: str = ""
+    wording: str = ""
+    grant_offer: dict | None = None
+    binding: str = ""
+    strict: bool = False  # reverify needs the same fingerprint (bounds included) and a quiet screen
+    permit: str | None = None
+    method: str = ""
+    params: dict = field(default_factory=dict)
+    money: str | None = None
+    plain: str = ""  # the binding with every number blanked (tells a price change from a moved target)
+    level: str = ""  # an ask's confirmation level: tap (Allow/Deny) | fingerprint (the screen lock)
+    field_ref: str = ""  # type_text, ENTER, DELETE: the field the gate judged; the phone types only into it (M2, L3)
+
+
+@dataclass
+class Grant:
+    kind: str
+    binding: str
+    duration_ms: int
+    issued: int  # monotonic ms
+    canon: str
+
+
+@dataclass
+class Pending:
+    approval_id: str
+    binding: str
+    created: int
+    risk: Risk
+    package: str
+    task: str
+    grant_offer: dict | None
+    counted: bool = False
+    digest: str = ""  # a task prompt: the request text's digest
+    text: str = ""  # a task prompt: the request text (the grant's scope comes from it)
+    step: bool = False  # a just-in-time task prompt: approving it also permits the step that raised it
+    level: str = "fingerprint"  # tap: an on-phone Allow/Deny signed with the tap key; fingerprint: the screen lock  # shown to the owner (only shown prompts count toward the prompt limit)
+
+
+class TestVerifier:
+    """Fixtures sign with sha256("test-key:" + message); the phone uses its Keystore key."""
+
+    @staticmethod
+    def sign(message: str) -> str:
+        return sha256("test-key:" + message)
+
+    def verify(self, message: str, signature: str) -> bool:
+        return bool(signature) and signature == self.sign(message)
+
+
+class TapVerifier(TestVerifier):
+    """The tap key (not bound to the screen lock): only OpenMob's own Allow button signs with it."""
+
+    @staticmethod
+    def sign(message: str) -> str:
+        return sha256("test-tap-key:" + message)
+
+
+class Clock:
+    def __init__(self):
+        self.elapsed = 10_000
+        self.wall = 1_800_000_000_000
+
+
+def policy_canon(record: dict) -> str:
+    keys = sorted(k for k in record if record[k] is not None)
+    return ";".join(f"{k}={_canon_value(record[k])}" for k in keys)
+
+
+def _canon_value(v) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    return str(v)
+
+
+# The rule of a refusal or blacked-out read for an app the owner blocked (docs/design/blocked-apps.md).
+OWNER_BLOCKED = "owner:blocked_apps"
+OWNER_BLOCKED_NAME = "owner:blocked_app_name"  # a home-screen tap on an owner-blocked app's icon (the Kotlin const)
+OWNER_BLOCKED_NOTIFICATION = "owner:blocked_app_notification"  # an act on an owner-blocked app's notification (review 5)
+BLOCKED_NOTIFICATION = "builtin:blocked_notification"  # a read blacked out for a blocked app's notification
+OWN_SERVER_REFUSAL = ("gate_denied", "builtin:own_server", "Agents can't act on this page on the phone. Go back, or call done.")
+_NON_HOST_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*:[^0-9]")
+_DOTS = re.compile("[\u3002\uff0e\uff61]")
+
+
+def _host_normal(s: str) -> str:
+    return _DOTS.sub(".", unicodedata.normalize("NFKC", s)).lower()
+
+
+def host_of(url: str | None) -> str | None:
+    """The host a link or an address bar's text names, as a browser reads it (Gatekeeper.hostOf): percent-decoded,
+    NFKC dots, lower case, IDNA."""
+    s = _host_normal(re.sub(r"[\t\n\r]", "", url or "").strip()).replace("\\", "/")
+    if not s or " " in s:
+        return None
+    if s.startswith("http:") or s.startswith("https:"):
+        s = s.split(":", 1)[1]
+    elif "://" in s:
+        s = s.split("://", 1)[1]
+    elif _NON_HOST_SCHEME.search(s):
+        return None
+    s = s.lstrip("/").split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].rsplit("@", 1)[-1]
+    s = _host_normal(_percent_decode(s))
+    if s.startswith("["):
+        return s.split("]", 1)[0] + "]"
+    s = s.split(":", 1)[0].rstrip(".")
+    if s.startswith("www."):
+        s = s[4:]
+    if not s or any(c in s for c in "/\\@?# %"):
+        return None
+    try:
+        s = s.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        pass
+    if s.startswith("www."):
+        s = s[4:]
+    return s or None
+
+
+def _percent_decode(s: str) -> str:
+    """%XX escapes as UTF-8 bytes (Gatekeeper.percentDecode); a lone "%" stays."""
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        hx = s[i + 1:i + 3] if s[i] == "%" and i + 2 < len(s) else ""
+        if len(hx) == 2 and all(c in "0123456789abcdefABCDEF" for c in hx):
+            out.append(int(hx, 16))
+            i += 3
+            continue
+        out += s[i].encode("utf-8")
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+class Gatekeeper:
+    def __init__(self, rules: Rules | None = None, clock: Clock | None = None, verifier=None, device: str = "dev",
+                 pages=None):
+        self.r = rules or Rules.load()
+        # The Settings pages open_settings can open: the app's fixed table (SettingsPages.kt; the server's copy is
+        # openmob/phone/settings_pages.py, checked against the Kotlin file by a test). Tests inject other tables.
+        self.pages = pages or _settings_pages().get
+        self.clock = clock or Clock()
+        self.verifier = verifier or TestVerifier()
+        self.tap_verifier = TapVerifier()
+        self.prompt_closed = -10**9  # when the last prompt closed (monotonic ms)
+        self.everyday = False  # "Don't confirm everyday actions": signed by the owner; tap-level steps then run
+        self.device = device
+        self.permits: dict[str, int] = {}  # binding -> expiry (monotonic ms)
+        self.pending: dict[str, Pending] = {}
+        self.followup: dict | None = None  # {package, task, expires, acts}
+        self.start_permits: dict[str, dict] = {}  # binding -> {package, task}: a flow-starting money approval
+        self.credits: list[dict] = []  # {kind, expires}
+        self.task_grants: dict[str, dict] = {}  # task id -> {digest, expires, used, apps}: the owner approved the task
+        self.own_requests: list[dict] = []  # requests typed or spoken on this phone: {digest, expires}
+        self.grants: list[Grant] = []
+        self.ceiling = "auto"
+        self.perm_defaults: dict[str, str] = {}  # the owner's signed (or tightened) permission-dialog defaults
+        self.accuracy_choice: tuple | None = None  # ("<window id>|<title>", precise|approximate): the card tapped
+        self.armed: tuple | None = None  # (binding, card): recorded once that tap's gesture completes
+        self.never: dict | None = None  # {issued, duration_ms, allow_money}
+        self.tokens = float(self.r.limits["act_burst"])
+        self.last_refill = self.clock.elapsed
+        self.asks: list[int] = []
+        self.denials: list[int] = []
+        self.suspended = False
+        self.last_app = ""
+        self.hwm = self.clock.elapsed
+        self.events: list[dict] = []
+        # Apps the owner blocked on this phone (docs/design/blocked-apps.md): exact package names, on top of the
+        # built-in sensitive apps. The host sets it (BlockedApps on the phone); the engine never adds or removes.
+        self.owner_blocked: set[str] = set()
+        # The paired server's host (review 5 H1): agents never act on its pages in a browser, in any mode.
+        self.server_hosts: set[str] = set()
+
+    # --- clock and expiry -------------------------------------------------------------
+
+    def now(self) -> int:
+        e = self.clock.elapsed
+        self.hwm = max(self.hwm, e)
+        return e
+
+    def _expire(self, now: int) -> None:
+        for aid, p in list(self.pending.items()):
+            if now - p.created >= self.r.limits["pending_ms"]:
+                del self.pending[aid]
+                self.prompt_closed = now
+                self.events.append({"state": "expired", "approval_id": aid})
+        self.permits = {b: e for b, e in self.permits.items() if e > now}
+        if self.followup and self.followup["expires"] <= now:
+            self.followup = None
+        self.credits = [c for c in self.credits if c["expires"] > now]
+        self.grants = [g for g in self.grants if g.issued + g.duration_ms > now]
+        if self.never and self.never["issued"] + self.never["duration_ms"] <= now:
+            self.never = None
+
+    def persist(self) -> dict:
+        now = self.now()
+        return {"hwm": self.hwm, "grants": [{"canon": g.canon, "remaining": g.issued + g.duration_ms - now}
+                                            for g in self.grants],
+                "never": None if not self.never else self.never["issued"] + self.never["duration_ms"] - now}
+
+    def reboot(self, saved: dict | None, elapsed_after: int) -> None:
+        """The phone restarted: the monotonic clock starts over. Grants count down from the remaining time
+        saved before the reboot; one whose remaining time can't be read expires (fail closed)."""
+        self.clock.elapsed = elapsed_after
+        now = elapsed_after
+        rebooted = now < self.hwm
+        grants = []
+        for g in self.grants:
+            remaining = None
+            if saved:
+                remaining = next((s["remaining"] for s in saved["grants"] if s["canon"] == g.canon), None)
+            if not rebooted:
+                grants.append(g)
+            elif remaining is not None and remaining > 0:
+                grants.append(Grant(g.kind, g.binding, g.duration_ms, now - (g.duration_ms - remaining), g.canon))
+        self.grants = grants
+        if self.never and rebooted:
+            remaining = saved.get("never") if saved else None
+            self.never = ({**self.never, "issued": now - (self.never["duration_ms"] - remaining)}
+                          if remaining and remaining > 0 else None)
+        # In-memory state does not survive a restart.
+        self.permits, self.pending, self.followup, self.credits = {}, {}, None, []
+        self.start_permits = {}
+        self.task_grants, self.own_requests = {}, []
+        self.tokens, self.last_refill = float(self.r.limits["act_burst"]), now
+        self.prompt_closed = -10**9
+        self.asks, self.denials = [], []
+        self.last_app, self.suspended = "", False
+        self.hwm = now
+
+    # --- signed owner policy ----------------------------------------------------------
+
+    def add_policy(self, record: dict, message: str, signature: str) -> bool:
+        """A record signed with the owner's screen-lock key (never from the server). A bad signature is
+        dropped: the built-ins (ceiling auto) apply."""
+        canon = policy_canon(record)
+        if message != f"gk1|policy|{canon}" or not self.verifier.verify(message, signature):
+            return False
+        return self._apply_policy(record, canon)
+
+    def _apply_policy(self, record: dict, canon: str) -> bool:
+        now = self.now()
+        lim = self.r.limits
+        kind = record.get("type")
+        if kind == "ceiling":
+            mode = record.get("mode")
+            if mode not in ("ask", "plan", "auto", "trusted"):
+                return False
+            self.ceiling = mode
+            return True
+        if kind == "never":
+            duration = min(int(record.get("duration_ms", 0)), lim["never_max_ms"])
+            if duration <= 0:
+                return False
+            self.never = {"issued": now, "duration_ms": duration, "allow_money": bool(record.get("allow_money"))}
+            return True
+        if kind == "everyday":
+            self.everyday = bool(record.get("on"))
+            return True
+        if kind == "permission_default":
+            perm, value = record.get("perm"), record.get("value")
+            if value not in self._perm_values(perm):
+                return False
+            self.perm_defaults[perm] = value
+            return True
+        if kind == "grant":
+            g_kind = record.get("kind")
+            if g_kind not in ("send", "post", "delete", "pay", "share", "settings", "fill", "permission") \
+                    or not record.get("binding"):
+                return False
+            cap = lim["pay_grant_max_ms"] if g_kind == "pay" else lim["grant_max_ms"]
+            duration = min(int(record.get("duration_ms", 0)), cap)
+            if duration <= 0:
+                return False
+            self.grants.append(Grant(g_kind, str(record["binding"]), duration, now, canon))
+            return True
+        return False
+
+    def _perm_values(self, perm) -> list:
+        """The settings a permission takes, tightest first."""
+        v = self.r.d["permission_dialog"]["values"]
+        return v.get(perm, v["default"]) if perm else []
+
+    def perm_setting(self, perm: str) -> str:
+        d = self.r.d["permission_dialog"]["defaults"]
+        return self.perm_defaults.get(perm) or d.get(perm, d["default"])
+
+    def everyday_off(self) -> None:
+        """A tightening, from anywhere: everyday actions are confirmed again."""
+        self.everyday = False
+
+    def tighten_permission(self, perm: str, value: str) -> bool:
+        """A tightening (deny, ask, approximate…) is taken from anywhere, unsigned; loosening needs a signed record."""
+        values = self._perm_values(perm)
+        if value not in values or values.index(value) >= values.index(self.perm_setting(perm)):
+            return False
+        self.perm_defaults[perm] = value
+        return True
+
+    def mode(self, requested: str | None) -> str:
+        ceiling = "never" if self.never else self.ceiling
+        if requested not in MODES:
+            requested = ceiling
+        mode = min((requested, ceiling), key=lambda m: MODES[m])
+        return "auto" if mode == "plan" else mode
+
+    # --- the owner's own instruction (D6) ---------------------------------------------
+
+    def note_instruction(self, text: str) -> None:
+        toks = tokens(text)
+        now = self.now()
+        self.own_requests.append({"digest": sha256(" ".join(text.split())),
+                                  "expires": now + self.r.limits["own_request_ms"]})
+        for kind in ("send", "post", "delete"):
+            if any_phrase(toks, self.r.w[kind]):
+                self.credits.append({"kind": kind, "expires": now + self.r.limits["requested_ms"]})
+
+    # --- kill switch ------------------------------------------------------------------
+
+    def resume(self) -> None:
+        """The owner resumed after a suspension (the notification's Resume)."""
+        self.suspended = False
+        self.denials = []
+
+    def stop_tasks(self) -> None:
+        """The Stop pill (the phone stays connected): every per-task permission goes; the owner's signed policy
+        (never, Always allow) and a pause after denials stay. Only tightens."""
+        for aid in list(self.pending):
+            self.events.append({"state": "expired", "approval_id": aid})
+        self.permits, self.pending, self.followup, self.credits = {}, {}, None, []
+        self.start_permits = {}
+        self.task_grants, self.own_requests = {}, []
+
+    def revoke_all(self) -> None:
+        for aid in list(self.pending):
+            self.events.append({"state": "expired", "approval_id": aid})
+        self.permits, self.pending, self.followup, self.credits = {}, {}, None, []
+        self.start_permits = {}
+        self.task_grants, self.own_requests = {}, []
+        self.never = None
+        self.suspended = False
+
+    # --- admit ------------------------------------------------------------------------
+
+    def admit(self, method: str, params: dict, screen: Screen) -> Admission:
+        self._judged_field = ""
+        a = self._admit(method, params, screen)
+        if a.decision in ("allow", "ask"):
+            a.field_ref = self._judged_field
+        return a
+
+    def _admit(self, method: str, params: dict, screen: Screen) -> Admission:
+        now = self.now()
+        self._expire(now)
+        params = params or {}
+        screen = self.with_ocr(screen)
+        if method in self.r.meta:
+            return Admission("allow", method=method, params=params)
+        if method in self.r.d["methods"]["task"]:
+            return self.request_task(params)
+        if method in self.r.read or method.startswith("stream_"):
+            hidden = self._hidden(screen)
+            if method in ("screenshot", "ui_elements", "wait_for") and hidden:  # wait_for reads the element list
+                return Admission("redact", rule=hidden, method=method, params=params)
+            if method == "stream_start" and hidden:
+                return self._refuse("gate_blocked_app", hidden, "A protected app is on screen, so the live view "
+                                    "can't start now.", method, params)
+            return Admission("allow", method=method, params=params)
+        if method not in self.r.act:
+            return self._refuse("gate_unknown_method", "builtin:methods", f"Unknown method {method}.", method, params)
+        if (bad := bad_params(params)) is not None:
+            return self._refuse("gate_bad_params", "builtin:bad_params", bad, method, params)
+        if not screen.available:
+            return self._refuse("gate_unavailable", "builtin:no_accessibility",
+                                "OpenMob's accessibility service is off, so the phone can't check this. Turn it on.",
+                                method, params)
+        if method != "wake_unlock" and screen.keyguard_locked and screen.keyguard_secure:
+            return self._refuse("phone_locked", "builtin:keyguard", "The phone is locked. Unlock it to continue.",
+                                method, params)
+        if method != "wake_unlock" and (dialog := self.owner_dialog(screen)):
+            return self._refuse("needs_owner_dialog", "builtin:owner_dialog", dialog, method, params)
+        j = self.judge(method, params, screen)
+        self._judged_field = j.field_ref
+        if j.refuse:
+            if self.pending and j.refuse[1] == "builtin:own_window":
+                # A gesture that would land on the phone's own prompt while it waits for the owner: wait, don't give
+                # up (Phase 5 item 1).
+                return self._refuse("gate_prompt_open", "builtin:prompt_open",
+                                    "Waiting for the owner to answer a prompt on the phone.", method, params, j.package)
+            return self._refuse(*j.refuse, method, params, package=j.package)
+        if self.suspended:
+            return self._refuse("gate_rate_limited", "builtin:suspended",
+                                "Paused on the phone after repeated denials. The owner can resume.", method, params)
+        money_fp = j.money_fp if (j.risk is not None and j.risk.money) else j.strict_fp
+        bind = binding(method, params, money_fp)
+        plain = binding(method, params, j.strict_fp)
+        if self.pending:
+            same = next((p for p in self.pending.values() if p.binding == bind), None)
+            if same is not None:  # the same action asked again: the prompt already showing, not a new one
+                return Admission("ask", code="gate_needs_approval", rule=f"risk:{same.risk.reason}",
+                                 kind=same.risk.kind, approval_id=same.approval_id, wording=same.risk.wording,
+                                 grant_offer=same.grant_offer, binding=bind, money=same.risk.money, plain=plain,
+                                 message="Waiting for the owner's approval on the phone.", method=method,
+                                 params=params, package=j.package)
+            return self._refuse("gate_prompt_open", "builtin:prompt_open",
+                                "Waiting for the owner to answer a prompt on the phone.", method, params)
+        if not self._take_token(now):
+            return self._refuse("gate_rate_limited", "builtin:act_rate", "Too many actions: wait a second.",
+                                method, params)
+        if method != "wake_unlock" and bind not in self.permits:
+            # Any other action voids every outstanding approval: what the owner saw may no longer be true (a
+            # quantity "+", another item scrolled into place). The honest server re-sends at once.
+            self.permits.clear()
+            self.start_permits.clear()
+        self._track_followup(method, params, j)
+        if j.app and j.package:
+            self.last_app = j.package
+        self.note_task_app(params, j.package, j.app)
+        mode = self.mode(params.get("mode"))
+        risk = j.risk
+        # A free install the task's own text doesn't name asks (owner, 2026-10-09); a priced one stays money.
+        if j.install_title is not None and not (risk is not None and risk.money):
+            # Only the request's text names the app: the phone attests it (task_attested) and shows it; the server's
+            # task id is never shown or attested (review M2, 2026-10-17).
+            request = str(params.get("task_text") or "")
+            name = j.install_title or "an app"
+            if not self.names_app(request, j.install_title):
+                risk = Risk("install", "install:unnamed", always=True,
+                            wording=f"Allow installing “{name}” from the Play Store? The request doesn't name this app.")
+            elif not self.task_attested(params):
+                # Named only by the server's word (review L2): the task prompt below asks for the whole task once,
+                # showing its text on the phone; approved, its grant attests the text and named installs run.
+                risk = Risk("install", "install:unattested",
+                            wording=f"Allow installing “{name}” from the Play Store?")
+        hint = str(params.get("hint") or "").strip()
+        if risk is None and hint and mode != "never":
+            risk = Risk("other", "server_hint", wording=self._wording(method, params, j, screen))
+        if mode == "ask" and j.changing and risk is None:
+            risk = Risk("step", "mode:ask", wording=self._wording(method, params, j, screen))
+        base = dict(method=method, params=params, package=j.package, plain=plain)
+        if risk is None:
+            return Admission("allow", strict=j.payment, binding=bind, **base)
+        if mode == "never":
+            if risk.money and not (self.never and self.never["allow_money"]):
+                return self._refuse("gate_denied", "never:money",
+                                    "Purchases are off while agents act without asking.", method, params, j.package)
+            if risk.always:
+                return self._refuse("gate_denied", f"never:{risk.reason}",
+                                    "Nobody can be asked while agents act without asking, so this is refused.",
+                                    method, params, j.package)
+            return Admission("allow", strict=True, binding=bind, kind=risk.kind, money=risk.money, **base)
+        if bind in self.permits:
+            return Admission("allow", strict=True, binding=bind, permit=bind, kind=risk.kind, money=risk.money, **base)
+        if mode != "ask" and (why := self._covered(risk, j.package, params)):
+            return Admission("allow", strict=True, binding=bind, kind=risk.kind, rule=why, money=risk.money, **base)
+        if mode != "ask" and self._task_covers(risk, params, j.package, screen):
+            return Admission("allow", strict=True, binding=bind, kind=risk.kind, rule="task_grant", **base)
+        if mode != "ask" and self.everyday and self.level(risk) == "tap" and risk.kind not in ("permission",
+                                                                                             "uninstall", "call",
+                                                                                             "install",
+                                                                                             "sensitive_number",
+                                                                                             "notification"):
+            return Admission("allow", strict=True, binding=bind, kind=risk.kind, rule="everyday", **base)
+        # Task approval, just in time: the first step that needs a tap-level confirmation asks for the task instead
+        # (worded from the request, with this step as the detail). A request typed on this phone needs no prompt.
+        task = str(params.get("task") or "")
+        text = " ".join(str(params.get("task_text") or "").split())[:300]
+        lazy = (mode != "ask" and task and text and self.level(risk) == "tap" and risk.kind not in ("task", "step")
+                and (risk.kind in self._task_kinds(text) or risk.reason == "install:unattested"))
+        if lazy and any(o["digest"] == sha256(text) and o["expires"] > now for o in self.own_requests):
+            self._mint_task(task, sha256(text), text)
+            self.note_task_app(params, j.package if j.app else self.last_app, True)
+            if self._task_covers(risk, params, j.package, screen):
+                return Admission("allow", strict=True, binding=bind, kind=risk.kind, rule="task_grant:own_request",
+                                 **base)
+        window = self.r.limits["ask_window_ms"]
+        self.asks = [t for t in self.asks if now - t < window]
+        if len(self.asks) >= self.r.limits["asks_per_window"]:
+            wait = max(1, -(-(self.asks[0] + window - now) // 60000))
+            return self._refuse("gate_rate_limited", "builtin:prompt_rate",
+                                f"Too many approval prompts on the phone: try again in {wait} min.",
+                                method, params, j.package)
+        aid = "gk" + uuid.uuid4().hex  # gate prompts are "gk…"; the legacy approval path refuses such ids
+        if lazy and (task not in self.task_grants or self.task_grants[task]["digest"] != sha256(text)
+                     or now >= self.task_grants[task]["expires"]):
+            wording = f"Agent wants to: {text}. Allow the steps this needs? Next: {risk.wording}"
+            p = Pending(aid, bind, now, Risk("task", "task", wording=wording), j.package if j.app else self.last_app,
+                        task, None, level="tap")
+            p.digest, p.text, p.step = sha256(text), text, True
+            self.pending[aid] = p
+            self.events.append({"state": "pending", "approval_id": aid})
+            return Admission("ask", code="gate_needs_approval", rule=f"risk:task:{risk.reason}", kind="task",
+                             approval_id=aid, wording=wording, binding=bind, level="tap",
+                             message="Waiting for the owner's approval of this task on the phone.", **base)
+        offer = self._offer(risk, mode)
+        self.pending[aid] = Pending(aid, bind, now, risk, j.package, str(params.get("task") or ""), offer,
+                                    level=self.level(risk))
+        self.events.append({"state": "pending", "approval_id": aid})
+        return Admission("ask", code="gate_needs_approval", rule=f"risk:{risk.reason}", kind=risk.kind,
+                         approval_id=aid, wording=risk.wording, grant_offer=offer, binding=bind, money=risk.money,
+                         level=self.level(risk),
+                         message="Waiting for the owner's approval on the phone.", **base)
+
+    # --- task approval (by owner request): one prompt for the task, its non-money risky steps then run --------
+
+    def request_task(self, params: dict) -> Admission:
+        """The server asks for a task grant at task start: the phone shows the request itself ("Agent wants to: …")
+        and the owner approves the task once. Requests typed or spoken on this phone need no prompt."""
+        now = self.now()
+        task = str(params.get("task") or "")
+        text = " ".join(str(params.get("text") or "").split())[:300]
+        source = " ".join(str(params.get("source") or "").split())[:60]
+        method = "task_grant"
+        if not task or not text:
+            return self._refuse("gate_denied", "builtin:task_request", "A task grant needs the task id and its "
+                                "request text.", method, params)
+        if self.suspended:  # paused after repeated denials: no task prompt either (review M5)
+            return self._refuse("gate_rate_limited", "builtin:suspended",
+                                "Paused on the phone after repeated denials. The owner can resume.", method, params)
+        digest = sha256(text)
+        bind = sha256(f"gk1-task|{task}|{digest}")
+        g = self.task_grants.get(task)
+        if g is not None and g["digest"] == digest and now < g["expires"]:
+            return Admission("allow", rule="task_grant", kind="task", method=method, params=params, binding=bind)
+        if self.everyday:  # everyday steps run unconfirmed anyway: no task prompt
+            return Admission("allow", rule="everyday", kind="task", method=method, params=params, binding=bind)
+        if any(o["digest"] == digest and o["expires"] > now for o in self.own_requests):
+            self._mint_task(task, digest, text)
+            return Admission("allow", rule="task_grant:own_request", kind="task", method=method, params=params,
+                             binding=bind)
+        same = next((p for p in self.pending.values() if p.binding == bind), None)
+        if same is not None:
+            return Admission("ask", code="gate_needs_approval", rule="risk:task", kind="task",
+                             approval_id=same.approval_id, wording=same.risk.wording, binding=bind, method=method,
+                             params=params, message="Waiting for the owner's approval on the phone.")
+        if self.pending:
+            return self._refuse("gate_prompt_open", "builtin:prompt_open",
+                                "Waiting for the owner to answer a prompt on the phone.", method, params)
+        window = self.r.limits["ask_window_ms"]
+        self.asks = [t for t in self.asks if now - t < window]
+        if len(self.asks) >= self.r.limits["asks_per_window"]:
+            return self._refuse("gate_rate_limited", "builtin:prompt_rate",
+                                "Too many approval prompts on the phone: try again later.", method, params)
+        wording = f"Agent wants to: {text}. Allow the steps this needs?"
+        risk = Risk("task", "task", wording=wording)
+        aid = "gk" + uuid.uuid4().hex
+        self.pending[aid] = Pending(aid, bind, now, risk, "", task, None, level="tap")
+        self.pending[aid].digest = digest
+        self.pending[aid].text = text
+        self.events.append({"state": "pending", "approval_id": aid})
+        return Admission("ask", code="gate_needs_approval", rule="risk:task", kind="task", approval_id=aid,
+                         wording=wording, binding=bind, method=method, params=params, level="tap",
+                         message="Waiting for the owner's approval of this task on the phone.")
+
+    def _mint_task(self, task: str, digest: str, text: str = "") -> None:
+        """The grant covers what the request names: the first app the task works in plus apps the request names,
+        and only the kinds of risky step its words ask for (a "share" request doesn't cover deleting or posting)."""
+        self.task_grants[task] = {"digest": digest, "expires": self.now() + self.r.limits["task_grant_ms"],
+                                  "used": 0, "apps": set(), "first": "", "words": tokens(text),
+                                  "kinds": self._task_kinds(text)}
+
+    def _task_kinds(self, text: str) -> set:
+        """The kinds of risky step a request's words ask for."""
+        toks = tokens(text)
+        kinds = {"other", "fill"}
+        for kind, extra in (("send", ["share", "message", "text", "reply", "forward", "email", "tell"]),
+                            ("share", ["share", "send", "forward"]), ("post", ["share"]),
+                            ("delete", ["unsubscribe", "clear", "remove", "empty", "uninstall"]),
+                            ("call", ["call", "dial", "phone", "ring"])):
+            if any_phrase(toks, self.r.w.get(kind, []) + extra):
+                kinds.add(kind)
+        return kinds
+
+    @staticmethod
+    def level(risk: Risk) -> str:
+        """Three confirmation levels (owner principle): a fingerprint only for money and dangerous actions (saved
+        cards and passwords in a browser or web page, OTP or card fields, permission grants); a simple on-phone
+        Allow/Deny for everyday-but-consequential ones (messages and shares to others, posts, deletes, native
+        autofill, unrecognized Settings changes, menus the server worries about). Low-risk actions never get here."""
+        if risk.money or (risk.kind == "fill" and risk.grant is None) or risk.kind in ("settings", "call_code"):
+            return "fingerprint"  # a Settings change the phone didn't recognize fails closed (D2): never a tap
+        return "tap"
+
+    def note_task_app(self, params: dict, package: str, app: bool) -> None:
+        """The first app a granted task works in is the app it's about."""
+        g = self.task_grants.get(str(params.get("task") or ""))
+        if g is not None and app and package and not g["first"]:
+            g["first"] = package
+
+    def _task_covers(self, risk: Risk, params: dict, package: str, screen: Screen | None = None) -> bool:
+        """Under the task's grant: the tap-level risky steps of the kinds its request asks for, in its first app or
+        an app the request names (the share sheet and other system surfaces count as the app they serve). Never
+        money, Settings, browser or WebView autofill, or permission dialogs (and never the hard denies)."""
+        g = self.task_grants.get(str(params.get("task") or ""))
+        if g is None or self.now() >= g["expires"] or g["used"] >= self.r.limits["task_grant_steps"]:
+            return False
+        text = " ".join(str(params.get("task_text") or "").split())[:300]
+        if text and sha256(text) != g["digest"]:
+            return False  # the grant was for another request
+        if risk.kind in ("task", "step", "sensitive_number") or self.level(risk) != "tap" or risk.kind not in g["kinds"]:
+            return False
+        app = package if package and (screen is None or any(
+            w.package == package and self._app_window(w) for w in screen.windows)) else self.last_app
+        if risk.reason.startswith("uninstall:"):
+            app = risk.grant or ""  # an uninstall counts as the app it removes
+        label = tokens((screen.labels.get(app) if screen else "") or "")
+        if app != g["first"] and not (label and has_phrase(g["words"], " ".join(label))):
+            return False
+        g["used"] += 1
+        if package:
+            g["apps"].add(package)  # the apps the task actually used
+        return True
+
+    def is_blocked(self, package: str | None) -> bool:
+        """A built-in sensitive app or one the owner blocked: refused in every mode, blacked out in reads."""
+        return self.r.blocked(package) or (bool(package) and package in self.owner_blocked)
+
+    def blocked_rule(self, package: str | None) -> str:
+        return "builtin:sensitive_apps" if self.r.blocked(package) else OWNER_BLOCKED
+
+    def _blocked_what(self, package: str | None) -> str:
+        return "a sensitive app" if self.r.blocked(package) else "an app the owner blocked on this phone"
+
+    def _hidden(self, screen: Screen) -> str:
+        """Why reads must not see this screen ("" if they may): a blocked app in any window, or an app window the
+        phone can't identify yet (it may be a blocked app still loading)."""
+        if any(self.r.blocked(w.package) for w in screen.windows):
+            return "builtin:sensitive_apps"
+        if any(w.package and w.package in self.owner_blocked for w in screen.windows):
+            return OWNER_BLOCKED
+        if any(self.blocked_notification(w, None, screen) is not None for w in screen.windows):
+            return BLOCKED_NOTIFICATION
+        # A system dialog Android hides from accessibility (a permission dialog: its window has no readable root) is
+        # identified from its window-state event: not sensitive, so reads show it; acts on it stay refused.
+        dialog = self._ocr_window(screen)
+        if any(not w.package and w.type == "application" and (dialog is None or w.id != dialog.id)
+               for w in screen.windows):
+            return "builtin:unknown_window"
+        return ""
+
+    def owner_dialog(self, screen: Screen) -> str | None:
+        """A system dialog the phone can't read is up (Android 14+ hides permission dialogs, Safety Center and
+        default-apps screens from accessibility): only the owner can answer it. Returns what to tell them."""
+        if self._ocr_window(screen) is None:
+            return None
+        text = str(screen.event.get("text") or "")
+        m = re.match(r"(?i)^allow\s+(.+?)\s+to\s", text)
+        if not m:
+            return "A system dialog needs your answer: choose on your phone, then the task continues."
+        kind = next((k for k, rx in self.r.d["permission_dialog"]["kinds"] if re.search(rx, text)), "")
+        what = kind.replace("_", " ") if kind else "a permission"
+        return f"{m.group(1)} is asking for {what}: choose on your phone, then the task continues."
+
+    def _refuse(self, code, rule, message, method, params, package="") -> Admission:
+        return Admission("refuse", code=code, rule=rule, message=message, method=method, params=params, package=package)
+
+    def _track_followup(self, method: str, params: dict, j: Judgement) -> None:
+        """A purchase flow's one terminal follow-up ends at an app switch, at BACK/HOME/recents, a launch or a link,
+        a tap on a cart or checkout word, and after 3 other actions."""
+        f = self.followup
+        if f is None:
+            return
+        name = str(params.get("name", "")).upper()
+        if (method in ("launch_app", "open_url", "open_settings") or (method == "key" and name in ("BACK", "HOME", "APP_SWITCH"))
+                or (j.app and j.package and j.package != f["package"])
+                or (j.label and any_phrase(j.label, self.r.d["cart_words"]))):
+            self.followup = None
+            return
+        f["acts"] += 1
+        if f["acts"] > 3:
+            self.followup = None
+
+    def _take_token(self, now: int) -> bool:
+        lim = self.r.limits
+        self.tokens = min(lim["act_burst"], self.tokens + (now - self.last_refill) * lim["act_per_second"] / 1000)
+        self.last_refill = now
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+
+    def _covered(self, risk: Risk, package: str, params: dict) -> str | None:
+        now = self.now()
+        if risk.money == "terminal" and self.followup and self.followup["package"] == package \
+                and self.followup["task"] == str(params.get("task") or ""):  # acts <= 3 (_track_followup)
+            self.followup = None
+            return "permit:purchase_flow"
+        if risk.kind in ("send", "post", "delete") and not risk.money:
+            for c in self.credits:
+                if c["kind"] == risk.kind:
+                    self.credits.remove(c)
+                    return "requested"
+        if risk.grant is not None:
+            wanted = {risk.grant}
+            if risk.kind == "permission" and risk.grant.endswith("|once"):
+                wanted.add(risk.grant[:-len("once")] + "while_using")  # "while using" covers "only this time"
+            for g in self.grants:
+                if g.kind == risk.kind and g.binding in wanted and g.issued + g.duration_ms > now:
+                    return "grant"
+        return None
+
+    def _offer(self, risk: Risk, mode: str) -> dict | None:
+        if risk.grant is None or mode == "ask":
+            return None
+        lim = self.r.limits
+        ms = lim["pay_grant_default_ms"] if risk.kind == "pay" else lim["grant_default_ms"]
+        return {"kind": risk.kind, "binding": risk.grant, "duration_ms": ms, "confirm_twice": risk.kind == "pay"}
+
+    # --- approvals --------------------------------------------------------------------
+
+    def approval_message(self, approval_id: str, grant: bool = False) -> str:
+        p = self.pending[approval_id]
+        msg = (f"gk1|tap|{self.device}|{approval_id}|{p.binding}" if p.level == "tap"
+               else f"gk1|{self.device}|{approval_id}|{p.binding}")
+        if grant and p.grant_offer:
+            msg += "|grant:" + policy_canon({"type": "grant", **{k: p.grant_offer[k] for k in
+                                                                 ("kind", "binding", "duration_ms")}})
+        return msg
+
+    def approve(self, approval_id: str, message: str, signature: str) -> bool:
+        """The owner passed the screen lock on the phone's own prompt: mint a one-shot permit for exactly
+        that action (and, if they ticked it, the "Always allow" grant)."""
+        now = self.now()
+        self._expire(now)
+        p = self.pending.get(approval_id)
+        if p is None:
+            return False
+        self.mark_shown(approval_id)  # answered, so it was seen
+        plain = self.approval_message(approval_id)
+        grant = None
+        if message != plain:
+            if not (p.grant_offer and message == self.approval_message(approval_id, grant=True)):
+                return False
+            grant = p.grant_offer
+        # A tap-level prompt is signed with the tap key, a fingerprint one with the screen-lock key: neither
+        # signature can approve the other kind (the messages are domain-separated too).
+        if not (self.tap_verifier if p.level == "tap" else self.verifier).verify(message, signature):
+            return False
+        del self.pending[approval_id]
+        self.prompt_closed = now
+        if p.risk.kind == "task":  # the owner approved the task: a grant (and the step that asked)
+            self._mint_task(p.task, p.digest, p.text)
+            if p.step:
+                self.permits[p.binding] = now + self.r.limits["permit_ms"]
+                if p.package:
+                    self.task_grants[p.task]["first"] = self.task_grants[p.task]["first"] or p.package
+            self.events.append({"state": "approved", "approval_id": approval_id})
+            return True
+        self.permits[p.binding] = now + self.r.limits["permit_ms"]
+        if p.risk.money == "start":  # the follow-up starts only when this very tap runs (reverify)
+            self.start_permits[p.binding] = {"package": p.package, "task": p.task}
+        if grant:
+            record = {"type": "grant", **{k: grant[k] for k in ("kind", "binding", "duration_ms")}}
+            self._apply_policy(record, policy_canon(record))
+        self.events.append({"state": "approved", "approval_id": approval_id})
+        return True
+
+    def mark_shown(self, approval_id: str) -> None:
+        """The prompt is on the owner's screen: now it counts toward the prompt limit."""
+        p = self.pending.get(approval_id)
+        if p is not None and not p.counted:
+            p.counted = True
+            self.asks.append(self.now())
+
+    def cancel(self, approval_id: str) -> bool:
+        """The prompt ended unanswered (dismissed, or the connection closed): no permit, and not a denial."""
+        if self.pending.pop(approval_id, None) is None:
+            return False
+        self.prompt_closed = self.now()
+        self.events.append({"state": "expired", "approval_id": approval_id})
+        return True
+
+    def deny(self, approval_id: str) -> bool:
+        now = self.now()
+        self.mark_shown(approval_id)
+        if self.pending.pop(approval_id, None) is None:
+            return False
+        self.prompt_closed = now
+        self.denials = [t for t in self.denials if now - t < self.r.limits["denial_window_ms"]] + [now]
+        if len(self.denials) >= self.r.limits["denials_to_suspend"]:
+            self.suspended = True
+        self.events.append({"state": "denied", "approval_id": approval_id})
+        return True
+
+    # --- reverify (right before the side effect, under the gesture lock) ------------------
+
+    def reverify(self, adm: Admission, screen: Screen) -> Admission:
+        """Right before the side effect. A Precise/Approximate tap on an OCR'd dialog is only armed here: the phone
+        records it once the gesture completed (completed()); a refused one makes it assume Precise again (B1)."""
+        self.armed = None
+        out = self._reverify(adm, screen)
+        if adm.decision == "allow" and adm.method == "tap":
+            card = self._ocr_card(adm, self.with_ocr(screen))
+            if out.decision != "allow":
+                if card is not None:
+                    self.accuracy_choice = None
+            elif card is not None:
+                self.armed = (adm.binding, card)
+        return out
+
+    def completed(self, adm: Admission) -> None:
+        """The gesture for an admitted action completed on the screen."""
+        if self.armed is not None and self.armed[0] == adm.binding:
+            self.accuracy_choice = self.armed[1]
+        self.armed = None
+
+    def _reverify(self, adm: Admission, screen: Screen) -> Admission:
+        if adm.decision != "allow" or adm.method not in self.r.act:
+            return adm
+        screen = self.with_ocr(screen)
+        # No gesture while a prompt is up, or just after one closed: an action admitted a moment before could land on
+        # its Allow (B1). The approved action itself (its permit) goes ahead.
+        if adm.method != "wake_unlock" and not adm.permit and (
+                self.pending or self.now() - self.prompt_closed < self.r.limits["prompt_cooldown_ms"]):
+            return self._refuse("gate_prompt_open", "builtin:prompt_cooldown",
+                                "An approval prompt is (or was just) on screen. Try again in a moment.",
+                                adm.method, adm.params, adm.package)
+        j = self.judge(adm.method, adm.params, screen)
+        if j.refuse:
+            self.permits.pop(adm.permit or "", None)
+            return self._refuse(*j.refuse, adm.method, adm.params, j.package)
+        if j.field_ref != adm.field_ref:  # focus moved to another field since the check (review M2, L3)
+            self.permits.pop(adm.permit or "", None)
+            return self._refuse("gate_screen_changed", "builtin:field_changed",
+                                "The focused field changed before typing. Look again.", adm.method, adm.params,
+                                j.package)
+        if adm.strict:
+            if binding(adm.method, adm.params, j.money_fp if adm.money else j.strict_fp) != adm.binding:
+                self.permits.pop(adm.permit or "", None)
+                if adm.money and binding(adm.method, adm.params, j.strict_fp) == adm.plain:
+                    return self._refuse("gate_screen_changed", "builtin:price_changed",
+                                        "The amount or price changed since it was approved. Look again.",
+                                        adm.method, adm.params, j.package)
+                return self._refuse("gate_screen_changed", "builtin:toctou",
+                                    "The screen changed before the action ran. Look again.", adm.method, adm.params,
+                                    j.package)
+            if screen.quiet_ms < self.r.limits["quiet_ms"]:
+                return self._refuse("gate_screen_unstable", "builtin:toctou",
+                                    "The screen is still changing. Try again in a moment.", adm.method, adm.params,
+                                    j.package)
+        elif j.risk is not None or j.payment:
+            return self._refuse("gate_screen_changed", "builtin:toctou",
+                                "The screen changed before the action ran. Look again.", adm.method, adm.params,
+                                j.package)
+        if adm.permit:
+            if self.permits.pop(adm.permit, None) is None:
+                return self._refuse("gate_screen_changed", "builtin:permit", "That approval was already used.",
+                                    adm.method, adm.params, j.package)
+            start = self.start_permits.pop(adm.permit, None)
+            if start is not None:
+                self.followup = {**start, "acts": 0,
+                                 "expires": self.now() + self.r.limits["purchase_followup_ms"]}
+        return adm
+
+    # --- permission dialogs Android hides from accessibility (Android 14+): the phone's own OCR -------------
+
+    def _ocr_window(self, screen: Screen, need_title: bool = True) -> Window | None:
+        """The permission-controller window with no readable tree: identified by its own package, or (when Android
+        hides even that, and sends no event either: Samsung, Android 15) by the phone's OCR of its own screenshot:
+        an "Allow X to ..." title AND either a fresh permission-controller event or a "Don't allow" button (the
+        dialog's shape). A stale event over an app still loading is not a dialog. `need_title=False`: whether the
+        phone should OCR the screen to find out (any window with no package and no readable tree)."""
+        perm = re.compile(self.r.s["permission_packages"])
+        event_pkg = str(screen.event.get("package") or "")
+        event_at = int(screen.event.get("at", 0) or 0)
+        for w in screen.ordered():
+            if w.type != "application":
+                continue
+            unread = w.root is None or not any(n.text or n.desc for n in walk(w.root, []))
+            if not unread:
+                continue
+            if perm.search(w.package or ""):
+                return w
+            if w.package:
+                continue
+            if not need_title:
+                return w
+            slack = self.r.d["permission_dialog"]["ocr"]["event_slack_ms"]  # the event may land just before the window
+            fresh = bool(perm.search(event_pkg)) and event_at >= w.since - slack
+            if self._ocr_title(screen) and (fresh or self._ocr_deny(screen)):
+                return w
+            return None  # only the top unreadable window can be the dialog
+        return None
+
+    def _ocr_lines(self, screen: Screen) -> list:
+        o = self.r.d["permission_dialog"]["ocr"]
+        return [" ".join(str(b.get("text", "")).split()) for b in (screen.ocr or [])
+                if float(b.get("conf", 1.0)) >= o["min_conf"]]
+
+    def _ocr_deny(self, screen: Screen) -> bool:
+        """The OCR shows a permission dialog's "Don't allow" (or its translation)."""
+        return any(self.text_role(t) in ("deny", "deny_forever") for t in self._ocr_lines(screen))
+
+    def ocr_candidate(self, screen: Screen) -> Window | None:
+        return self._ocr_window(screen, need_title=False)
+
+    def _ocr_title(self, screen: Screen) -> bool:
+        """The phone's OCR shows a permission dialog's title ("Allow Kalshi to ...") with confidence."""
+        lines = self._ocr_lines(screen)
+        # One line, or two in a row (a title wrapped or split where the app name is bold).
+        return any(self.perm_app(t) for t in lines + [a + " " + b for a, b in zip(lines, lines[1:])])
+
+    def text_role(self, text: str) -> str | None:
+        toks = tokens(text)
+        for role, label in self.r.d["permission_dialog"]["button_texts"]:
+            if toks and toks == tokens(label):
+                return role
+        return None
+
+    def perm_app(self, message: str) -> str | None:
+        """The requesting app's name, from the dialog's title ("Allow Kalshi to ...")."""
+        for rx in self.r.d["permission_dialog"]["titles"]:
+            m = re.search(rx, message)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    GRANT_ROLES = ("allow", "deny", "deny_forever", "one_time", "foreground", "always")
+
+    def with_ocr(self, screen: Screen) -> Screen:
+        """The screen with the hidden permission dialog rebuilt from the phone's OCR. Only the dialog card counts
+        (review H1, M3): the title is the permission-style title nearest above the Allow/Deny buttons, and lines
+        outside the card (that title down to the last button of the button stack) are dropped. Precise/Approximate
+        count only between the title and the buttons. Any doubt (no title, more than one permission-style title on
+        screen, no buttons under it) marks the dialog `ocr_unsure`: every grant on it asks. Each button line is a
+        clickable node (its box padded), the rest text; the root is clickable, so any other tap in it asks."""
+        w = self._ocr_window(screen)
+        if w is None:
+            self.accuracy_choice = None  # the dialog is gone: its card choice with it
+            return screen
+        if screen.ocr is None:
+            return screen
+        o = self.r.d["permission_dialog"]["ocr"]
+        lines = sorted((b for b in screen.ocr if str(b.get("text", "")).strip()
+                        and float(b.get("conf", 1.0)) >= o["min_conf"]),
+                       key=lambda b: (b["bounds"][1], b["bounds"][0]))
+        pad = o["pad"]
+        start = re.compile(o["title_start"])
+        texts = [" ".join(str(b["text"]).split()) for b in lines]
+        roles = [self.text_role(t) for t in texts]
+        bounds = [tuple(int(v) for v in b["bounds"]) for b in lines]
+        # Every permission-style title on screen: a line starting like one, plus its wrapped lines up to the '?'.
+        blocks, used = [], set()
+        for k in range(len(lines)):
+            if k in used or roles[k] is not None or not start.search(texts[k]):
+                continue
+            idx, j = [k], k
+            while not texts[j].endswith("?") and len(idx) < o["title_lines"] and j + 1 < len(lines) \
+                    and roles[j + 1] is None:
+                j += 1
+                idx.append(j)
+            text = " ".join(texts[i] for i in idx)
+            if self.perm_app(text) is None:
+                continue
+            used.update(idx)
+            blocks.append({"idx": idx, "text": text, "top": min(bounds[i][1] for i in idx),
+                           "bottom": max(bounds[i][3] for i in idx)})
+        buttons = [i for i in range(len(lines)) if roles[i] in self.GRANT_ROLES]
+
+        def below(b):
+            return sorted((i for i in buttons if bounds[i][1] >= b["bottom"]), key=lambda i: bounds[i][1])
+
+        with_buttons = [b for b in blocks if below(b)]
+        chosen = max(with_buttons, key=lambda b: b["top"]) if with_buttons else None
+        unsure = len(blocks) != 1 or chosen is None
+        keep = None
+        card_top, first_button_top = None, None
+        if chosen is not None:
+            stack = []
+            for b in below(chosen):
+                if not stack:
+                    stack.append(b)
+                    continue
+                last = bounds[stack[-1]]
+                height = max(1, last[3] - last[1])
+                if bounds[b][1] - last[3] <= o["button_gap_lines"] * height:
+                    stack.append(b)
+                else:
+                    break
+            box = [bounds[i] for i in chosen["idx"] + stack]
+            left, right = min(b[0] for b in box) - pad, max(b[2] for b in box) + pad
+            top, bottom = chosen["top"] - pad, max(b[3] for b in box) + pad
+            card_top, first_button_top = chosen["bottom"], bounds[stack[0]][1]
+            if not unsure:  # in doubt every grant asks anyway: keep every line, so the prompt names the button
+                keep = (left, top, right, bottom)
+        message = chosen["text"] if chosen else (" ".join(texts[i] for i in range(len(lines)) if roles[i] is None)
+                                                 or "?")
+        key = f"{w.id}|{message}"
+        if self.accuracy_choice and self.accuracy_choice[0] != key:
+            self.accuracy_choice = None  # another dialog: assume Precise again
+        choice = None if unsure else self.accuracy_choice
+        nodes = []
+        for i in range(len(lines)):
+            l, t, r, bt = bounds[i]
+            if keep is not None and not (l >= keep[0] and r <= keep[2] and t >= keep[1] and bt <= keep[3]):
+                continue
+            text, role = texts[i], roles[i]
+            card_role = role in ("precise", "approximate")
+            in_card = chosen is not None and t >= card_top and bt <= first_button_top
+            if role is not None and (not card_role or in_card or chosen is None):
+                checked = None
+                if card_role:  # OCR can't see the radio: Android pre-selects Precise
+                    checked = role == (choice[1] if choice else "precise")
+                nodes.append(Node(text=text, id="ocr", cls="OCRText", bounds=(l - pad, t - pad, r + pad, bt + pad),
+                                  clickable=True, checked=checked))
+                continue
+            nodes.append(Node(text=text, cls="OCRText", bounds=(l, t, r, bt)))
+        nodes.insert(0, Node(text=message, id="permission_message", cls="OCRText"))
+        if unsure:
+            nodes.insert(1, Node(id="ocr_unsure", cls="OCRText"))
+        root = Node(cls="OCRDialog", bounds=w.bounds, clickable=True, children=nodes)
+        event_pkg = str(screen.event.get("package") or "")
+        pkg = w.package or (event_pkg if re.search(self.r.s["permission_packages"], event_pkg)
+                            else self.r.d["permission_dialog"]["ocr"]["package"])
+        rebuilt = Window(w.id, w.type, w.layer, pkg, w.title, w.bounds, root)
+        return dc_replace(screen, windows=[rebuilt if x is w else x for x in screen.windows])
+
+    def _ocr_card(self, adm: Admission, screen: Screen) -> tuple | None:
+        """(window id, precise|approximate) when this tap is on an OCR'd dialog's location card."""
+        t = hit_test(self.r, screen, float(adm.params.get("x", -1)), float(adm.params.get("y", -1)))
+        if t is None or t.window.root is None or t.window.root.cls != "OCRDialog":
+            return None
+        if any(c.id == "ocr_unsure" for c in t.window.root.children):
+            return None
+        message = next((c.text for c in t.window.root.children if c.id == "permission_message"), "")
+        role = self._perm_role(t)
+        # Keyed by the window and its title: the same window with another question starts from Precise again (M1).
+        return (f"{t.window.id}|{message}", role) if role in ("precise", "approximate") else None
+
+    # --- the judge: what the action touches and how risky it is ---------------------------
+
+    def label(self, screen: Screen, package: str) -> str:
+        return screen.labels.get(package) or package
+
+    def _wording(self, method, params, j: Judgement, screen: Screen) -> str:
+        app = self.label(screen, j.package) if j.package else "this phone"
+        return {"type_text": f"Allow typing into a field in {app}?", "key": f"Allow pressing Enter in {app}?",
+                "launch_app": f"Allow opening {app}?",
+                "open_url": f"Allow opening {params.get('url', '')!s:.80} in {app}?",
+                "open_settings": j.wording or "Allow opening a Settings page?"}.get(
+            method, f"Allow this action in {app}?")
+
+    def admits_without_pill(self, method: str, params: dict, screen: Screen) -> bool:
+        """Would this gesture be judged acceptable (not refused) without OpenMob's Stop pill on screen? Only then does
+        the phone move the pill out of the way and judge again. No side effects."""
+        if method not in ("tap", "long_press", "swipe"):
+            return False
+        bare = dc_replace(screen, windows=[w for w in screen.windows
+                                                    if not (own_overlay(self.r, w) and catches_touches(w))])
+        return self.judge(method, params, self.with_ocr(bare)).refuse is None
+
+    def judge(self, method: str, params: dict, screen: Screen) -> Judgement:
+        r = self.r
+        if method in ("swipe", "long_press"):  # review M1: a gesture longer than max_ms is refused (Gatekeeper.tooLong)
+            ms = float(params.get("duration_ms") or 0)
+            cap = r.d["swipe"].get("max_ms", 10000)
+            if ms > cap:
+                return Judgement(changing=True, refuse=("gate_denied", "builtin:gesture_too_long",
+                                                        f"A swipe or long press lasts at most {cap // 1000} s on this "
+                                                        "phone. Send a shorter one."))
+        if (own := self._own_server(method, params, screen)) is not None:
+            return own
+        if method in ("tap", "long_press"):
+            return self._judge_point(method, float(params.get("x", -1)), float(params.get("y", -1)), screen)
+        if method == "swipe":
+            x1, y1, x2, y2 = (float(params.get(k, -1)) for k in ("x1", "y1", "x2", "y2"))
+            duration = float(params.get("duration_ms", 300))
+            dist = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            if dist <= 2 * self.slop(screen) or duration < r.d["swipe"]["tap_ms"]:
+                return self._judge_point("swipe", x1, y1, screen)
+            # A drag that starts on a clickable control (or a drawn spot) is at least as strict as a tap there, wherever
+            # it ends, unless a real scroller above that control takes it (review H1, M1, 2026-10-17).
+            swipe = self._judge_swipe(x1, y1, x2, y2, screen)
+            press = self._judge_press(x1, y1, x2, y2, screen)
+            if press is None or self._strictness(swipe) > self._strictness(press):
+                return swipe
+            if self._strictness(swipe) == self._strictness(press) and swipe.risk is not None and press.risk is not None \
+                    and press.risk.reason in ("unlabeled", "canvas_unread"):
+                return swipe  # the same strictness, and the swipe's says more ("Allow sliding “Tip amount”")
+            return press
+        if method == "type_text":
+            return self._judge_typing(str(params.get("text", "")), screen, params.get("replace") is True)
+        if method == "key":
+            return self._judge_key(str(params.get("name", "")).upper(), screen)
+        if method == "launch_app":
+            return self._judge_launch(str(params.get("package", "")), screen)
+        if method == "open_url":
+            return self._judge_url(str(params.get("url", "")), screen, method)
+        if method == "open_settings":
+            return self._judge_open_settings(str(params.get("page", "")), str(params.get("package", "")), screen)
+        return Judgement()  # wake_unlock: wakes the screen, never touches a secure lock
+
+    def _judge_open_settings(self, key: str, package: str, screen: Screen) -> Judgement:
+        """A Settings deep link (docs/design/deep-links.md), judged like opening that page (D2): the key must be in
+        the phone's fixed table; a page the hard-deny list names (by action, like an activity, or by title) is
+        refused whatever the table says; an app's own pages are refused for blocked apps and OpenMob; an ask-tier
+        page (manual date and time) asks with the screen lock; everyday pages open."""
+        r = self.r
+        fp = f"settings|{key}|{package}"
+        j = Judgement(fp=fp, strict_fp=fp, changing=True)
+        page = self.pages(key)
+        if page is None:
+            j.refuse = ("gate_denied_page", "builtin:settings_unknown_page",
+                        f"No Settings page '{key}' on this phone's list. Navigate there instead.")
+            return j
+        if re.compile(r.s["refuse_activities"]).search(page.action) or any_phrase(tokens(page.title), r.s["refuse"]):
+            j.refuse = ("gate_denied_page", "builtin:settings_security",
+                        "This Settings page is security-critical; agents can't open it.")
+            return j
+        if page.needs_package:
+            j.package = package
+            if not package:
+                j.refuse = ("gate_denied_page", "builtin:settings_package", f"The {page.title} page needs an app's package.")
+            elif package in r.own:
+                j.refuse = ("gate_blocked_app", "builtin:own_app", "OpenMob's own Settings pages are off-limits to agents.")
+            elif self.is_blocked(package):
+                j.refuse = ("gate_blocked_app", self.blocked_rule(package),
+                            f"Blocked on the phone: {package} is {self._blocked_what(package)}, so its Settings pages "
+                            "are off-limits too. Call done.")
+            if j.refuse:
+                return j
+        j.wording = f"Allow opening the {page.title} Settings page" + (
+            f" of {self.label(screen, package)}" if package else "") + "?"
+        if page.tier == "ask":
+            j.risk = Risk("settings", "settings_page", always=True, wording=j.wording)
+        return j
+
+    def _uninstall_dialog(self, w: Window) -> bool:
+        rx = re.compile(self.r.d["uninstall"]["message"])
+        return any(rx.search(n.text or "") for n in walk(w.root, []))
+
+    def _uninstall_target(self, w: Window, screen: Screen) -> str:
+        """The app an uninstall dialog or app-info page is about: the installed app whose label it shows (the
+        longest match), "protected" for OpenMob or a blocked app, "" if the phone can't tell."""
+        texts = [tokens(n.text) for n in walk(w.root, []) if n.text]
+        if any(has_phrase(tx, own) for tx in texts for own in self.r.d["uninstall"]["own_labels"]):
+            return "protected"
+        best, size = "", 0
+        for pkg, lbl in screen.labels.items():
+            lt = tokens(lbl)
+            if pkg in self.r.installers or pkg == w.package or not lt:
+                continue
+            if any(has_phrase(tx, " ".join(lt)) for tx in texts):
+                if self.is_blocked(pkg) or pkg in self.r.own:
+                    return "protected"
+                if len(lt) > size:
+                    best, size = pkg, len(lt)
+        return best
+
+    def _surface_refusal(self, w: Window, t: Target | None) -> tuple | None:
+        r = self.r
+        if not w.package:
+            return ("gate_screen_unstable", "builtin:unknown_window",
+                    "That part of the screen can't be read yet (an app may still be loading). Look again.")
+        if own_overlay(r, w):
+            return ("gate_denied_page", "builtin:own_indicator",
+                    "That's OpenMob's Stop button (its agent indicator); agents can't touch it. Tap somewhere else, or "
+                    "scroll what you need away from that corner.")
+        if w.package in r.own:
+            return ("gate_denied_page", "builtin:own_window", "That's OpenMob's own screen; agents can't touch it.")
+        if w.package == r.surf["systemui"]:
+            title = re.compile(r.surf["prompt_titles"])
+            ids = re.compile(r.surf["prompt_ids"])
+            if title.search(w.title or "") or any(ids.search(n.id or "") for n in walk(w.root, [])):
+                return ("gate_denied_page", "builtin:prompt_surface",
+                        "That's the lock screen or a system approval prompt; agents can't touch it.")
+        if w.package in r.installers and not self._uninstall_dialog(w):
+            return ("gate_denied_page", "builtin:installer", "Installing apps is off-limits to agents.")
+        if self.is_blocked(w.package):
+            return ("gate_blocked_app", self.blocked_rule(w.package),
+                    f"Blocked on the phone: {w.package} is {self._blocked_what(w.package)}. Don't open it another "
+                    "way; call done.")
+        return None
+
+    def _app_window(self, w: Window) -> bool:
+        """An app's own window (what "the task's app" and a purchase flow's app are), not a system surface."""
+        r = self.r
+        return (w.type == "application" and w.package != r.surf["systemui"] and not self._is_settings(w)
+                and w.package not in r.surf["share_packages"] and w.package not in r.surf["credential_packages"]
+                and not re.search(r.s["permission_packages"], w.package or "") and w.package not in r.installers)
+
+    def _is_settings(self, w: Window) -> bool:
+        if self.r.settings_pkg.search(w.package or ""):
+            return True
+        return w.package == self.r.s["gms_package"] and bool(
+            re.compile(self.r.s["gms_settings_titles"]).search(w.title or ""))
+
+    def _settings_tier(self, w: Window, t: Target | None, screen: Screen, label: list[str]) -> tuple:
+        """("refuse", rule) | ("blocked", rule) | ("ask", page) | ("allow", "") | ("none", "")."""
+        s = self.r.s
+        title = page_title(w)
+        activity = screen.activity if w.type == "application" else ""
+        if w.package in s["ask_packages"]:  # e.g. the VPN consent dialog
+            return ("ask", w.package)
+        if any_phrase(title, s["refuse"]) or any_phrase(label, s["refuse"]) or (
+                activity and re.compile(s["refuse_activities"]).search(activity)):
+            return ("refuse", "builtin:settings_security")
+        page = "/".join([w.package, activity, " ".join(title)])
+        screen_toks = tokens(" ".join(f"{n.text} {n.desc}" for n in walk(w.root, [])))
+        if any_phrase(title, s["app_info_markers"]) or (has_phrase(screen_toks, "force stop") and (
+                has_phrase(screen_toks, "uninstall") or has_phrase(screen_toks, "disable"))):
+            blocked_labels = [tokens(lbl) for pkg, lbl in screen.labels.items() if self.is_blocked(pkg)]
+            texts = [tokens(n.text) for n in walk(w.root, []) if n.text]
+            if any(bl and bl in texts for bl in blocked_labels):
+                return ("blocked", "builtin:app_info_blocked")
+            if any_phrase(label, s["app_info_ask"]):
+                return ("ask", page)
+            if any_phrase(label, s["app_info_delete"]):
+                return ("delete", page)
+            if any_phrase(label, s["app_info_allowed"]):
+                return ("allow", "")
+            return ("none", "")
+        if any_phrase(title, s["ask_pages"]) or any_phrase(label, s["ask_pages"]):
+            if label and any_phrase(label, self.r.w["navigation"]) == " ".join(label):
+                return ("allow", "")
+            return ("ask", page)
+        if re.compile(s["permission_packages"]).search(w.package or "") or has_phrase(title, "permissions") \
+                or has_phrase(title, "permission"):
+            if self._session_app_asks(w, screen, title):
+                return ("allow", "")
+            return ("ask", page) if self._changing_tap(t, label) else ("none", "")
+        if (has_phrase(title, "notifications") or has_phrase(title, "notification")) and self._changing_tap(t, label):
+            # Notification switches for a blocked app (a bank's alerts) or for OpenMob itself ask (review L1).
+            protected = [tokens(v) for k, v in screen.labels.items() if self.is_blocked(k) or k in self.r.own] + \
+                [tokens(x) for x in self.r.d["uninstall"]["own_labels"]]
+            if any(p and (has_phrase(label, " ".join(p)) or has_phrase(title, " ".join(p))) for p in protected):
+                return ("ask", page)
+        if any_phrase(title, s["everyday"]) or any_phrase(label, s["everyday"]):
+            return ("allow", "")
+        return ("ask", page) if self._changing_tap(t, label) else ("none", "")
+
+    def _session_app_asks(self, w: Window, screen: Screen, title: list[str]) -> bool:
+        """Is this permission request from the app the task is using? The dialog names the app in one place
+        ("Allow <app> to ..."); without that line, the requesting app's window must be right underneath; on a
+        Settings permission page, its header must name the app."""
+        session = tokens(screen.labels.get(self.last_app, "")) if self.last_app else []
+        if not session:
+            return False
+        message = next((n.text for n in walk(w.root, []) if n.id.endswith("permission_message") and n.text), "")
+        if message:
+            app = tokens(self.perm_app(message) or "")
+            if not app:
+                return False
+            if app == session:
+                return True
+            # The dialog may name the app shorter or longer than its label ("Chess" for "Chess.com"): then the
+            # requesting app's window must also be right underneath.
+            below = [x for x in screen.ordered() if x.layer < w.layer and x.type == "application"]
+            return (app == session[:len(app)] or session == app[:len(session)]) and bool(below) \
+                and below[0].package == self.last_app
+        if re.compile(self.r.s["permission_packages"]).search(w.package or ""):
+            below = [x for x in screen.ordered() if x.layer < w.layer and x.type == "application"]
+            return bool(below) and below[0].package == self.last_app
+        return has_phrase(title, " ".join(session))
+
+    def _perm_role(self, t: Target) -> str | None:
+        pd = self.r.d["permission_dialog"]
+        for n in (t.pressed, t.hit):
+            if n is not None and n.id:
+                for role, rx in pd["button_ids"]:
+                    if re.search(rx, n.id):
+                        return role
+        label = t.label_tokens()
+        for role, text in pd["button_texts"]:
+            if label and " ".join(label) == " ".join(tokens(text)):
+                return role
+        return None
+
+    def _permission_dialog(self, w: Window, t: Target, screen: Screen):
+        """A tap in a runtime permission dialog: a Risk, None, or a refusal (code, rule, message). Denying (and
+        "Approximate") is always fine. "Allow all the time" never. The owner's settings: `deny` lets only "Don't
+        allow" through; the task's own app may then grant what they allow without a prompt (signed per-app grants
+        first; built in: while using the app, notifications allowed, location approximate); another app's request
+        and a button the phone doesn't recognize ask (a tap-level prompt)."""
+        pd = self.r.d["permission_dialog"]
+        message = next((n.text for n in walk(w.root, []) if n.id.endswith("permission_message") and n.text), "")
+        kind = next((k for k, rx in pd["kinds"] if re.search(rx, message)), "other")
+        role = self._perm_role(t)
+        name = self.perm_app(message) or "this app"
+        if role is None:
+            # A button the phone doesn't recognize (other ids, another language, OCR it couldn't read) may grant: ask.
+            changing = t.pressed is not None and (t.pressed.clickable or t.pressed.long_clickable
+                                                  or t.pressed.checked is not None)
+            return Risk("permission", "permission:unknown", always=True,
+                        wording=f"Allow {name}'s permission request?") if changing else None
+        if role in ("deny", "deny_forever", "approximate"):
+            return None
+        if role == "always":
+            return ("gate_permission_choice", "permission:always",
+                    "Never \"Allow all the time\": tap \"While using the app\" (or \"Only this time\") instead.")
+        if any(n.id == "ocr_unsure" for n in walk(w.root, [])):
+            # The OCR couldn't pin down which question the dialog asks (no title, or more than one permission-style
+            # title on screen, e.g. one an app drew above the real dialog): any grant asks (review H1).
+            return Risk("permission", "permission:ocr_unsure", always=True,
+                        wording=f"Allow {name}'s permission request? The phone couldn't tell for sure which "
+                                "permission it is: check the dialog.")
+        what = "precise location" if role == "precise" else kind.replace("_", " ")
+        wording = f"Allow {name} to use your {what}?"
+        if role == "precise":
+            value, setting_kind = "precise", "location_accuracy"
+        elif kind == "notifications":
+            value, setting_kind = "allow", "notifications"
+        else:
+            value, setting_kind = ("once" if role == "one_time" else "while_using"), kind
+        setting = self.perm_setting(setting_kind)
+        own = self._session_app_asks(w, screen, page_title(w))
+        grant = f"{self.last_app}|{setting_kind}|{value}"
+        if setting == "deny" and not (own and self._perm_granted(grant)):
+            return ("gate_permission_choice", f"permission:{setting_kind}:deny",
+                    f"The owner's setting for {setting_kind.replace('_', ' ')} is Don't allow: tap \"Don't allow\".")
+        if not own:
+            return Risk("permission", "permission:other_app", always=True, wording=wording)
+        if role == "precise":
+            ok = setting == "precise"
+        elif kind == "notifications":
+            ok = setting == "allow"
+        else:
+            # "Only this time" by default; where the dialog doesn't offer it, the next narrowest grant.
+            only_once = any(self._perm_role(Target(w, [n])) == "one_time" for n in walk(w.root, []) if n.clickable)
+            # ...except a lasting grant of a dangerous kind (contacts, SMS…): it asks unless the owner signed
+            # persistent_grants: allow.
+            lasting = kind in self.r.d["permission_dialog"]["persistent_ask"] and \
+                self.perm_setting("persistent_grants") != "allow"
+            ok = setting == "while_using" or (setting == "once" and (role == "one_time" or (not only_once and not lasting)))
+        ok = ok or self._perm_granted(grant)
+        if ok and kind == "location" and self.perm_setting("location_accuracy") != "precise" and \
+                self._precise_selected(w) and not self._perm_granted(f"{self.last_app}|location_accuracy|precise"):
+            # Android pre-selects Precise: granting now would give precise location against the owner's setting.
+            return ("gate_permission_choice", "permission:location_accuracy",
+                    "The owner allows approximate location only: tap \"Approximate\" first, then grant.")
+        if ok:
+            return None
+        return Risk("permission", f"permission:{setting_kind}", always=True, grant=grant, wording=wording)
+
+    def _perm_granted(self, grant: str) -> bool:
+        """A signed per-app permission grant ("Always allow" on an earlier prompt)."""
+        wanted = {grant}
+        if grant.endswith("|once"):
+            wanted.add(grant[:-len("once")] + "while_using")
+        now = self.now()
+        return any(g.kind == "permission" and g.binding in wanted and g.issued + g.duration_ms > now
+                   for g in self.grants)
+
+    def _precise_selected(self, w: Window) -> bool:
+        for n in walk(w.root, []):
+            if n.checked is True and self._perm_role(Target(w, [n])) == "precise":
+                return True
+        return False
+
+    def _changing_tap(self, t: Target | None, label: list[str]) -> bool:
+        if t is not None and any(n.checked is not None for n in (t.pressed, t.hit) if n is not None):
+            return True
+        return any_phrase(label, self.r.s["change_words"]) is not None
+
+    def _word_risk(self, label: list[str], ids: list[str], package: str, payment: bool,
+                   priced: bool = True) -> Risk | None:
+        r = self.r
+        words = strip_phrases(label, r.w["pre_commit"] + r.w["reversible"])
+        id_words = []
+        for rid in ids:
+            toks = id_tokens(rid)
+            for w in r.d["resource_id_risky"]:
+                if w not in r.d["resource_id_pre_commit"] and (has_phrase(toks, w) or (" " not in w and w in toks)):
+                    id_words.append(w)
+        money_ctx = payment or bool(r.money_app.search(package or ""))
+        flow = any_phrase(words, r.w["flow_start"]) or next((w for w in id_words if w in ("buy", "purchase",
+                                                                                          "transfer")), None)
+        if flow in ("subscribe", "join") and not (priced or money_ctx):
+            # YouTube's free Subscribe, a free group's Join: reversible, and money only with a price nearby or a
+            # billing sheet.
+            flow = None
+        if flow:
+            return Risk("pay", f"words:{flow}", money="start", grant=package)
+        terminal = any_phrase(words, r.w["terminal"]) or next(
+            (w for w in id_words if w in ("pay", "place order", "placeorder", "confirm")), None)
+        if terminal:
+            if terminal in ("confirm", "submit") and not money_ctx:
+                return Risk("other", f"words:{terminal}")
+            return Risk("pay", f"words:{terminal}", money="terminal", grant=package)
+        for kind in ("send", "post", "delete"):
+            w = any_phrase(words, r.w[kind])
+            if w:
+                return Risk(kind, f"words:{w}", grant=package)
+        for w in id_words:
+            if w == "send":
+                return Risk("send", "id:send", grant=package)
+            if w in ("delete", "remove"):
+                return Risk("delete", f"id:{w}", grant=package)
+            if w == "submit":
+                return Risk("other", "id:submit")
+        return None
+
+    # --- Play Store installs (owner, 2026-10-09) -----------------------------------------------------
+
+    def install_buttons(self, w: Window) -> int:
+        """How many Install/Get buttons the window shows (a label that is exactly the word; one counted per button,
+        not again for its own label inside it). More than one: a results page (review M3, 2026-10-17)."""
+        rx = re.compile(self.r.d["install"]["button_words"])
+        count = 0
+
+        def visit(n: Node, inside: bool) -> None:
+            nonlocal count
+            hit = not inside and (rx.search(n.text or "") or rx.search(n.desc or ""))
+            if hit:
+                count += 1
+            for c in n.children:
+                visit(c, inside or bool(hit))
+        if w.root is not None:
+            visit(w.root, False)
+        return count
+
+    def store_title(self, w: Window, button: Node | None) -> str:
+        """The app's name on a Play Store page ("" when it can't be told; review M3, 2026-10-17): the topmost text
+        in the install button's own card (its nearest ancestor holding a usable text: the details header on a
+        details page, the row on a results page) that starts above the button's bottom and isn't a button, rating,
+        count or badge. Never an editable field, a search box or a toolbar's text, nor the button's own label. With
+        more than one Install/Get button on screen (a results page) there is no one app: "". Mirrors the server's
+        gate.store_title."""
+        if self.install_buttons(w) > 1 or w.root is None:
+            return ""
+        skip = re.compile(self.r.d["install"]["title_skip"])
+        search = re.compile(self.r.d["search_field"])
+        bottom = button.bounds[3] if button is not None else None
+
+        def usable(root: Node) -> list:
+            out = []
+
+            def visit(n: Node, hidden: bool) -> None:
+                if n is button:
+                    return
+                hidden = hidden or n.editable or "EditText" in (n.cls or "") or "Toolbar" in (n.cls or "") \
+                    or bool(search.search(n.id or "")) or bool(search.search(n.hint or ""))
+                t = (n.text or "").strip()
+                if not hidden and len(t) >= 2 and not skip.search(t) and (bottom is None or n.bounds[1] < bottom):
+                    out.append(n)
+                for c in n.children:
+                    visit(c, hidden)
+            visit(root, False)
+            return out
+
+        def path_to(n: Node, path: list) -> list | None:
+            if n is button:
+                return path
+            for c in n.children:
+                found = path_to(c, path + [n])
+                if found is not None:
+                    return found
+            return None
+        cards = list(reversed(path_to(w.root, []) or [])) if button is not None else []
+        for card in cards or [w.root]:
+            texts = usable(card)
+            if texts:
+                return min(texts, key=lambda n: (n.bounds[1], n.bounds[0])).text.strip()
+        return ""
+
+    def task_attested(self, params: dict) -> bool:
+        """The phone itself holds this task's request text (review L2, 2026-10-17): the owner approved it on the phone
+        (a task grant whose digest is this text's) or typed it here. The server's task_text alone is only a claim."""
+        task = str(params.get("task") or "")
+        text = " ".join(str(params.get("task_text") or "").split())[:300]
+        if not task or not text:
+            return False
+        digest, now = sha256(text), self.now()
+        g = self.task_grants.get(task)
+        if g is not None and g["digest"] == digest and now < g["expires"]:
+            return True
+        return any(o["digest"] == digest and o["expires"] > now for o in self.own_requests)
+
+    def install_intent(self, request: str, lead: str | None) -> bool:
+        """The request asks for an install (review 3 F3-M2): an `intent` word or phrase, or an `intent_verbs` word
+        followed later by an `intent_nouns` word or, after any `intent_skip` words, by `lead` (the leading name word)."""
+        ins = self.r.d["install"]
+        if re.search(ins["intent"], request or ""):
+            return True
+        toks = re.findall(r"[a-z0-9]+", (request or "").lower())
+        for i, t in enumerate(toks):
+            if t not in ins["intent_verbs"]:
+                continue
+            rest = toks[i + 1:]
+            if any(w in ins["intent_nouns"] for w in rest):
+                return True
+            j = 0
+            while j < len(rest) and rest[j] in ins["intent_skip"]:
+                j += 1
+            if lead and j < len(rest) and rest[j] == lead:
+                return True
+        return False
+
+    def names_app(self, request: str, title: str) -> bool:
+        """The request asks to install the store page's app (review 3 F3-M2, owner 2026-10-18: intent + name): it asks
+        for an install, and the title's first distinctive name word and at least half of them (rounded up) are words
+        of the request. A title with no distinctive word is never named."""
+        generic = set(self.r.d["install"]["generic"]) | set(self.r.d["install"]["stop"])
+        name = re.split(r"\s[-\u2013\u2014|]\s|:\s", title or "", maxsplit=1)[0]  # up to a tagline
+        words: list[str] = []
+        for x in re.findall(r"[a-z0-9]+", name.lower()):
+            if len(x) >= 3 and not x.isdigit() and x not in generic and x not in words:
+                words.append(x)
+        if not words:
+            return False
+        asked = set(re.findall(r"[a-z0-9]+", (request or "").lower()))
+        have = sum(w in asked for w in words)
+        if words[0] not in asked or 2 * have < len(words):
+            return False
+        return self.install_intent(request, words[0])
+
+    # --- phone calls (review H2) ----------------------------------------------------------------
+
+    def call_app(self, package: str) -> bool:
+        """A dialer, contacts app or in-call screen: its call buttons place calls."""
+        return package in self.r.d["calls"]["packages"]
+
+    @staticmethod
+    def mmi(text: str) -> bool:
+        """An MMI/USSD code (call forwarding `**21*…#`, settings codes): any * or #, plain or percent-encoded."""
+        return "*" in text or "#" in text or "%23" in text or "%2a" in text.lower()
+
+    def completes_code(self, number: str) -> bool:
+        """The dialer's number would then be a complete MMI/USSD code: it starts with * or # and has a later #."""
+        return bool(re.search(self.r.d["calls"]["code_complete"], number))
+
+    def _dialed_number(self, w: Window) -> str:
+        rx = re.compile(self.r.d["calls"]["number_ids"])
+        nodes = walk(w.root, [])
+        n = next((n for n in nodes if rx.search(n.id or "") and n.text), None) or \
+            next((n for n in nodes if (n.editable or "EditText" in (n.cls or "")) and n.text), None)
+        return n.text.strip() if n else ""
+
+    @staticmethod
+    def _call_code_risk(number: str, app: str) -> Risk:
+        return Risk("call_code", "call:mmi", always=True,
+                    wording=f"Allow dialing the code “{number[:40]}” in {app}? Codes with * or # can change phone "
+                            "settings, such as forwarding your calls.")
+
+    def _call_risk(self, t: Target, label: list[str], ids: list[str], screen: Screen, x: float, y: float) -> Risk | None:
+        """A tap that places a call: in a dialer, contacts app or in-call screen, a label or id that says call or
+        dial (not end call, call history…), or the dialpad's * and # keys; in any app, a button labelled exactly
+        Call, or voice/video call. A number with * or # asks with the screen lock."""
+        raw = [f"{n.text}{n.desc}".strip() for n in (t.pressed, t.hit) if n is not None]
+        risk = self._call_judge(t.window, label, ids, raw, t.shown(), screen)
+        if risk is not None:
+            return risk
+        # The hit test follows the last child that contains the point, but a view drawn above its siblings by
+        # elevation (Google Phone's dialpad over a full-screen layer) isn't always last: any clickable node under the
+        # point that places a call counts (seen on the emulator, review C).
+        for n in walk(t.window.root, []):
+            if not (n.clickable or n.long_clickable) or not n.contains(x, y) or n is t.pressed:
+                continue
+            sub = walk(n, [], 40)
+            lbl = tokens(" ".join(v for m in sub for v in (m.text, m.desc) if v))
+            shown = next(((m.text or m.desc).strip() for m in sub if m.text or m.desc), "")
+            risk = self._call_judge(t.window, lbl, [n.id] if n.id else [], [f"{n.text}{n.desc}".strip()], shown, screen)
+            if risk is not None:
+                return risk
+        return None
+
+    def _call_judge(self, w: Window, label: list[str], ids: list[str], raw: list[str], shown: str,
+                    screen: Screen) -> Risk | None:
+        c = self.r.d["calls"]
+        app = self.label(screen, w.package)
+        if any_phrase(label, c["safe_words"]) or any(re.search(c["safe_ids"], i) for i in ids):
+            return None
+        if self.call_app(w.package):
+            # The # key completing a code (owner, 2026-10-10: the * key alone never runs one).
+            pound = any(x == "#" for x in raw) or any(re.search(c["code_keys"], i) for i in ids) or \
+                (len(label) == 1 and label[0] == "pound")
+            if pound and self.completes_code(self._dialed_number(w) + "#"):
+                return self._call_code_risk(self._dialed_number(w) + "#", app)
+            if not (any_phrase(label, c["words"]) or any(re.search(c["ids"], i) for i in ids)):
+                return None
+            number = self._dialed_number(w) or shown
+            if self.mmi(number):
+                return self._call_code_risk(number, app)
+            return Risk("call", "call:dial", wording="Allow placing a call" +
+                        (f" to “{number[:40]}”" if number else "") + f" from {app}?")
+        if label == ["call"] or any_phrase(label, c["any_app_words"]) or any(re.search(c["any_app_ids"], i)
+                                                                            for i in ids):
+            return Risk("call", "call:button", wording=f"Allow starting a call (“{shown[:40]}”) in {app}?")
+        return None
+
+    def slop(self, screen: Screen) -> float:
+        """The touch slop: the phone's own (ViewConfiguration.getScaledTouchSlop) or rules.json's, the larger."""
+        return max(self.r.d["swipe"]["slop_px"], screen.touch_slop or 0)
+
+    def _judge_press(self, x1, y1, x2, y2, screen: Screen) -> Judgement | None:
+        """A drag judged as a press at its start (review H1, M1, 2026-10-17): over every target under the start, as a
+        tap is (not only the hit path), each one whose pressed node is clickable (not a slider: a slider keeps its own
+        judgement), plus a drawn spot (M3). A target is left out only when something on its own path, up to the
+        pressed control, can really scroll the drag's way: that scroller takes the touch, so nothing is pressed. A
+        scrollable sibling layer above it in the tree doesn't count. None: nothing under the start is pressed."""
+        r = self.r
+        hit_t = hit_test(r, screen, x1, y1)
+        if hit_t is None:
+            return None
+        slider = re.compile(r.d["slider_class"])
+        # A drag on a drawn view (a game's board) presses what's drawn there; elsewhere an unlabeled spot isn't pressed.
+        canvas = self.canvas_spot(screen, x1, y1) and self.drawn_view(screen, x1, y1)
+
+        def keep(c: Target) -> bool:
+            p = c.pressed
+            clicky = p is not None and (p.clickable or p.long_clickable) and not slider.search(p.cls or "")
+            drawn = canvas and c.pressed is hit_t.pressed and c.hit is hit_t.hit
+            if not (clicky or drawn):
+                return False
+            upto = c.path[:next(i for i, n in enumerate(c.path) if n is p) + 1] if clicky else c.path
+            return not scrolls_away(upto, x1, y1, x2, y2)
+
+        return self._judge_point("swipe", x1, y1, screen, keep=keep)
+
+    def _judge_point(self, method: str, x: float, y: float, screen: Screen, keep=None) -> Judgement | None:
+        """A tap, judged by every clickable or labeled node under the point, not only the hit path: a view drawn above
+        its siblings by elevation isn't always the last child. The strictest verdict wins (refuse > ask with the
+        screen lock > ask with a tap > allow); on a tie, the hit path's, unless only another target is labeled (the
+        prompt then names it: review I-3, 2026-10-17). A blocked app's window under the one on top, at the point,
+        refuses too. [keep]: only these targets (a drag's press); None when none is left."""
+        r = self.r
+        t = hit_test(r, screen, x, y)
+        if t is None:  # no window there that the phone knows of: it can't judge the touch
+            if keep is not None:
+                return None
+            return Judgement(changing=True, refuse=("gate_screen_unstable", "builtin:no_window",
+                                                    "The phone can't see what's there. Look again."))
+        cands = [t] + [a for a in targets_at(t.window, x, y) if not (a.pressed is t.pressed and a.hit is t.hit)]
+        if keep is not None:
+            cands = [c for c in cands if keep(c)]
+            if not cands:
+                return None
+        for w in screen.ordered():
+            if w is not t.window and w.layer < t.window.layer and w.type == "application" and \
+                    contains(w.bounds, x, y) and self.is_blocked(w.package):
+                return Judgement(package=w.package, changing=True, refuse=(
+                    "gate_blocked_app", self.blocked_rule(w.package),
+                    f"Blocked on the phone: {w.package} is {self._blocked_what(w.package)}, under what's on top here. "
+                    "Don't open it another way; call done."))
+        bar = self._sensitive_bar(screen)
+        if bar is not None and t.window.id == bar[0].id and not any(
+                n.id == bar[1].id and n.cls == bar[1].cls and n.bounds == bar[1].bounds for n in t.path):
+            # Review M4: the address bar holds a link carrying a card number or SSN; a tap on a suggestion row (or any
+            # other tap in the browser) could open it. Clearing the bar (DELETE) or a tap on the bar itself still works.
+            return Judgement(package=t.window.package, fp=t.fp(False), strict_fp=t.fp(True), changing=True,
+                             refuse=("gate_denied", "builtin:sensitive_link",
+                                     f"The address bar holds a link carrying {describe_sensitive(bar[2])}; a tap here "
+                                     "could open it, and links never carry them out. Clear the address bar first."))
+        drawn = self._drawn_at(screen, x, y)
+        best, rank = None, -1
+        for c in cands:
+            if rank >= 3:
+                break
+            j = self._judge_target(method, c, x, y, screen, drawn)
+            s = self._strictness(j)
+            if s > rank or (s == rank and s > 0 and not best.label and j.label):
+                best, rank = j, s
+        return best
+
+    # --- drawn spots: canvas words read by the phone's own OCR (review M3, 2026-10-17) ----------------------------
+
+    def _canvas_window(self, screen: Screen, x: float, y: float) -> Target | None:
+        """The hit path at (x, y) when it's in an app window the phone read (not an OCR'd dialog), else None."""
+        t = hit_test(self.r, screen, x, y)
+        if t is None or t.window.type != "application" or not t.path or t.window.root is None \
+                or t.window.root.cls == "OCRDialog":
+            return None
+        return t
+
+    @staticmethod
+    def _size(n) -> int:
+        return max(0, n.bounds[2] - n.bounds[0]) * max(0, n.bounds[3] - n.bounds[1])
+
+    def drawn_view(self, screen: Screen, x: float, y: float) -> bool:
+        """A drawn view is under (x, y): a SurfaceView, TextureView, GLSurfaceView, game engine or Flutter view (by
+        class), or a childless view with no label covering big_view of the window."""
+        t = self._canvas_window(screen, x, y)
+        if t is None:
+            return False
+        c = self.r.d["canvas"]
+        wl, wt, wr, wb = t.window.bounds
+        area = max(1, (wr - wl) * (wb - wt))
+        cls = re.compile(c["classes"])
+        stack, seen = [t.window.root], 0
+        while stack and seen < 2000:
+            n = stack.pop()
+            seen += 1
+            if not n.contains(x, y):
+                continue
+            if cls.search(n.cls or "") or (not n.children and not (n.text or n.desc or n.id)
+                                            and self._size(n) >= c["big_view"] * area):
+                return True
+            stack.extend(reversed(n.children))
+        return False
+
+    def canvas_spot(self, screen: Screen, x: float, y: float) -> bool:
+        """Is (x, y) a drawn spot, whose words the phone must read itself (OCR)? In an app window, either no clickable
+        node with a label is under the point, or a drawn view is under it (drawn_view) and every labeled clickable
+        over it is tiny (under tiny_label of the window: icon-sized labels can't vouch for a drawn button)."""
+        t = self._canvas_window(screen, x, y)
+        if t is None:
+            return False
+        c = self.r.d["canvas"]
+        wl, wt, wr, wb = t.window.bounds
+        area = max(1, (wr - wl) * (wb - wt))
+        cands = [t] + targets_at(t.window, x, y)
+        labeled = [k.pressed for k in cands if k.pressed is not None
+                   and (k.pressed.clickable or k.pressed.long_clickable) and k.labeled()]
+        if not labeled:
+            return True
+        return self.drawn_view(screen, x, y) and all(self._size(n) < c["tiny_label"] * area for n in labeled)
+
+    def _drawn_at(self, screen: Screen, x: float, y: float):
+        """The words drawn at a drawn spot (canvas_spot), from the phone's OCR: (text near the point, every line read),
+        or ("?", "") when they couldn't be read; None when the spot isn't drawn. Near: a line within about one row of
+        the point (its own height, at least row_min_px, above and below) overlapping a band dx of the window's width
+        on each side; and a price in a line starting just below the point (within `below` of the window's height)."""
+        if not self.canvas_spot(screen, x, y):
+            return None
+        if screen.drawn is None:
+            return ("?", "")
+        c = self.r.d["canvas"]
+        t = hit_test(self.r, screen, x, y)
+        wl, wt, wr, wb = t.window.bounds
+        dx = c["dx"] * (wr - wl)
+        below = c["below"] * (wb - wt)
+        near, every = [], []
+        for line in sorted(screen.drawn, key=lambda d: (d["bounds"][1], d["bounds"][0])):
+            text = " ".join(str(line.get("text", "")).split())
+            if not text:
+                continue
+            every.append(text)
+            left, top, right, bottom = line["bounds"]
+            h = max(c["row_min_px"], bottom - top)
+            if right < x - dx or left > x + dx:
+                continue
+            if top - h <= y <= bottom + h or (y < top <= y + below and amounts(text)):
+                near.append(text)
+        return (" ".join(near), " ".join(every))
+
+    def _strictness(self, j: Judgement) -> int:
+        """refuse 3 > ask with the screen lock 2 > ask with a tap 1 > allow 0."""
+        if j.refuse:
+            return 3
+        if j.risk is None:  # a Play Store install: a tap-level ask unless the task text names the app (admit)
+            return 1 if j.install_title is not None else 0
+        return 2 if self.level(j.risk) == "fingerprint" else 1
+
+    def _names_blocked_app(self, w, t: Target, screen: Screen) -> str | None:
+        """A home-screen tap (icon, folder, app drawer, Recents card) on something named after an installed blocked
+        app: a node whose text or description, up to a first comma, is exactly the app's label. Launcher windows only
+        (rules launcher_packages): elsewhere a name is only a name. 2026-10-18: Google Authenticator by its icon."""
+        if not re.search(self.r.d["launcher_packages"]["packages"], w.package or ""):
+            return None
+        blocked = {pkg: tokens(lbl) for pkg, lbl in screen.labels.items() if self.is_blocked(pkg) and tokens(lbl)}
+        if not blocked:
+            return None
+        pressed, hit = t.pressed, t.hit
+        if pressed is not None and (pressed.clickable or pressed.long_clickable):
+            nodes = walk(pressed, [], 40)
+        else:
+            nodes = [pressed] if pressed is not None else []
+        if hit is not None:
+            nodes.append(hit)
+        # Inside a home-screen widget (review 5 P5-M1): everything the widget shows names it.
+        widget_rx = re.compile(self.r.d["launcher_packages"]["widget_class"])
+        for n in reversed(t.path):
+            if widget_rx.search(n.cls or ""):
+                nodes += walk(n, [], 80)
+                break
+        for n in nodes:
+            for s in (n.text, n.desc):
+                if not s:
+                    continue
+                toks = tokens(s.split(",", 1)[0])
+                for pkg, lbl in blocked.items():
+                    if lbl == toks:
+                        return pkg
+        return None
+
+    # --- review 5: notifications of blocked apps (P5-M1), the paired server's own pages (H1) -------------------------
+
+    def _notification_risk(self, wording: str) -> Risk:
+        return Risk("notification", "notification_action", always=True, wording=wording)
+
+    def _notification_refusal(self, pkg: str) -> tuple:
+        return ("gate_blocked_app", "builtin:sensitive_notification" if self.r.blocked(pkg) else OWNER_BLOCKED_NOTIFICATION,
+                "Blocked on the phone: that notification is from a protected app. Leave it alone; call done.")
+
+    def blocked_notification(self, w: Window, t: Target | None, screen: Screen) -> str | None:
+        """A notification of an installed blocked app in System UI (Gatekeeper.blockedNotification)."""
+        if w.package != self.r.surf["systemui"] or w.root is None:
+            return None
+        blocked = {pkg: tokens(lbl) for pkg, lbl in screen.labels.items() if self.is_blocked(pkg) and tokens(lbl)}
+        if not blocked:
+            return None
+        header_rx = re.compile(self.r.surf["notification_app_ids"])
+
+        def header(n: Node) -> bool:
+            return bool(n.text) and bool(header_rx.search(n.id or ""))
+
+        def named(texts) -> str | None:
+            for s in texts:
+                if not s:
+                    continue
+                toks = tokens(s.split(",", 1)[0])
+                for pkg, lbl in blocked.items():
+                    if lbl == toks:
+                        return pkg
+            return None
+
+        if t is None:
+            return named(n.text for n in walk(w.root, []) if header(n))
+        for n in reversed(t.path):
+            headers = [h for h in walk(n, []) if header(h)]
+            if headers:
+                return named(h.text for h in headers)
+        p = t.pressed
+        nodes = (walk(p, [], 40) if p is not None and (p.clickable or p.long_clickable) else ([p] if p is not None else []))
+        nodes = nodes + ([t.hit] if t.hit is not None else [])
+        return named(s for n in nodes for s in (n.text, n.desc))
+
+    def is_server_host(self, url: str | None) -> bool:
+        if not self.server_hosts:
+            return False
+        h = host_of(url)
+        return h is not None and any(h == s or h.endswith("." + s) for s in self.server_hosts)
+
+    def server_page(self, screen: Screen) -> Window | None:
+        if not self.server_hosts:
+            return None
+        ids = re.compile(self.r.d["server_page"]["url_ids"])
+        for w in screen.windows:
+            browser = self.r.is_cat("browser", w.package)
+            seen = [0]
+
+            def shows(n: Node, in_page: bool) -> bool:
+                seen[0] += 1
+                if seen[0] > 2000:
+                    return False
+                page = in_page or "WebView" in n.cls
+                if n.text and (ids.search(n.id or "") or (browser and not page and looks_like_url(n.text))) \
+                        and self.is_server_host(n.text):
+                    return True
+                return any(shows(c, page) for c in n.children)
+
+            if w.root is not None and shows(w.root, False):
+                return w
+        return None
+
+    def _own_server(self, method: str, params: dict, screen: Screen) -> Judgement | None:
+        if not self.server_hosts:
+            return None
+        acts = method in ("tap", "long_press", "swipe", "type_text") or (
+            method == "key" and str(params.get("name", "")).upper() in ("ENTER", "DELETE"))
+        if not acts:
+            return None
+        w = self.server_page(screen)
+        if w is None:
+            return None
+        return Judgement(package=w.package, changing=True, refuse=OWN_SERVER_REFUSAL)
+
+    def _judge_target(self, method: str, t: Target, x: float, y: float, screen: Screen, drawn=None) -> Judgement:
+        r = self.r
+        w = t.window
+        j = Judgement(package=w.package, fp=t.fp(False), strict_fp=t.fp(True), changing=True,
+                      app=self._app_window(w))
+        j.money_fp = j.strict_fp + "|$" + ",".join(money_amounts(w, t))
+        unread = drawn is not None and drawn == ("?", "")
+        near = "" if drawn is None or unread else drawn[0]
+        if drawn is not None:
+            # The drawn words bind an approval like a label (review M3): another drawn button asks again.
+            mark = "|drawn:" + ("?" if unread else " ".join(tokens(vol(near))))
+            j.fp, j.strict_fp = j.fp + mark, j.strict_fp + mark
+            j.money_fp = j.strict_fp + "|$" + ",".join(sorted(set(money_amounts(w, t)) | set(amounts(near))))
+        if refusal := self._surface_refusal(w, t):
+            j.refuse = refusal
+            return j
+        if pkg := self._names_blocked_app(w, t, screen):
+            j.package = pkg
+            j.refuse = ("gate_blocked_app", "builtin:sensitive_app_name" if r.blocked(pkg) else OWNER_BLOCKED_NAME,
+                        f"Blocked on the phone: that opens {self.label(screen, pkg)}, {self._blocked_what(pkg)}. "
+                        "Don't open it another way; call done.")
+            return j
+        if pkg := self.blocked_notification(w, t, screen):
+            j.package, j.refuse = pkg, self._notification_refusal(pkg)
+            return j
+        pressed = t.pressed
+        if pressed is not None and (pressed.editable or "EditText" in pressed.cls):
+            j.changing = False  # focusing a field changes nothing
+        label = t.label_tokens() + tokens(near)
+        j.label = label
+        ids = t.ids()
+        j.payment = payment_context(r, screen) or (drawn is not None and drawn_payment(r, drawn[1]))
+        shown = t.shown() or near[:60]
+        app_label = self.label(screen, w.package)
+        source = self.last_app or w.package
+        in_browser = r.is_cat("browser", source) or t.in_webview()
+
+        def wording(verb="Allow tapping"):
+            return f"{verb} “{shown}” in {app_label}?" if shown else f"{verb} an unlabeled spot in {app_label}?"
+
+        if re.compile(r.s["permission_packages"]).search(w.package or "") and any(
+                n.id.endswith("permission_message") and n.text for n in walk(w.root, [])):
+            # The question is part of what an approval binds: the same button under another question (content
+            # swapped in place) needs a new approval (review M1).
+            msg = next(n.text for n in walk(w.root, []) if n.id.endswith("permission_message") and n.text)
+            msg = "|msg:" + " ".join(tokens(msg))
+            j.fp, j.strict_fp, j.money_fp = j.fp + msg, j.strict_fp + msg, j.money_fp + msg
+            res = self._permission_dialog(w, t, screen)
+            if isinstance(res, tuple):
+                j.refuse = res
+            else:
+                j.risk = res
+            return j
+        # Settings
+        tier = ("none", "")
+        if self._is_settings(w):
+            tier = self._settings_tier(w, t, screen, label)
+            if tier[0] == "refuse":
+                j.refuse = ("gate_denied_page", tier[1], "This Settings page is security-critical; agents can't "
+                                                         "change it.")
+                return j
+            if tier[0] == "blocked":
+                j.refuse = ("gate_blocked_app", tier[1], "That's a blocked app's settings; agents can't touch it.")
+                return j
+            if tier[0] == "delete" or (tier[0] == "allow" and any_phrase(label, ["uninstall"])):
+                target = self._uninstall_target(w, screen)
+                if target == "protected":
+                    j.refuse = ("gate_denied_page", "builtin:uninstall_protected",
+                                "OpenMob and blocked apps can't be uninstalled or changed by agents.")
+                    return j
+                if tier[0] == "delete":  # Disable, Clear storage: a delete-kind step on that app (tap level)
+                    j.risk = Risk("delete", "uninstall:app_info", grant=target or None, wording=wording()) \
+                        if target else Risk("uninstall", "uninstall:unknown", wording=wording())
+                    return j
+                return j  # Uninstall: opens the installer's confirmation, which asks
+        # The package installer's uninstall confirmation (installing is refused above): a delete-kind step.
+        if w.package in r.installers:
+            target = self._uninstall_target(w, screen)
+            if target == "protected":
+                j.refuse = ("gate_denied_page", "builtin:uninstall_protected",
+                            "OpenMob and blocked apps can't be uninstalled by agents.")
+                return j
+            if label and any(" ".join(label) == " ".join(tokens(c)) for c in r.d["uninstall"]["confirm"]):
+                name = self.label(screen, target) if target else "an app"
+                j.risk = Risk("delete", "uninstall:installer", grant=target, wording=f"Allow uninstalling {name}?") \
+                    if target else Risk("uninstall", "uninstall:unknown", wording="Allow uninstalling an app?")
+            return j
+        # Autofill and credential surfaces: always ask.
+        cred_title = re.compile(r.surf["credential_titles"])
+        surface = (w.type == "input_method" or w.package in r.surf["credential_packages"]
+                   or (screen.autofill_service and w.package == screen.autofill_service)
+                   or (w.package == r.s["gms_package"] and cred_title.search(w.title or "")))
+        if surface or any_phrase(label, r.w["credential"]):
+            # What gets filled is the focused field: grants bind to its app, never to a browser or WebView page.
+            field_ = focused_field(screen)
+            filled = field_[0].package if field_ else ""
+            web = bool(field_) and (r.is_cat("browser", filled) or any("WebView" in n.cls for n in field_[2]))
+            grant = None if (not filled or web or self.is_blocked(screen.autofill_service)) else filled
+            j.risk = Risk("fill", "autofill", always=True, grant=grant,
+                          wording=f"Fill your saved card or password into {self.label(screen, filled or source)}?")
+            return j
+        # Share sheets: what is shared, to whom. A public link to yourself, or copying it, is low risk.
+        if w.package in r.surf["share_packages"] and (re.compile(r.surf["share_titles"]).search(w.title or "")
+                                                       or w.package != "android"):
+            link = shares_link(r, w)
+            if any_phrase(label, r.w["copy"]) or (link and is_self(r, label, screen)):
+                return j
+            j.risk = Risk("share", "share:" + ("link" if link else "content"), grant=f"{source}>{' '.join(label)}",
+                          wording=f"Share to “{shown or 'this target'}”?")
+            return j
+        # Notification action buttons: always ask (review 5 P5-M1)
+        if w.package == r.surf["systemui"] and pressed is not None and pressed is not w.root and (
+                re.compile(r.surf["notification_action_ids"]).search(pressed.id or "") or "Button" in pressed.cls):
+            j.risk = self._notification_risk(f"Allow tapping “{shown}” on a notification?" if shown
+                                             else "Allow tapping a notification's button?")
+            return j
+        call = self._call_risk(t, label, ids, screen, x, y)
+        if call is not None:
+            j.risk = call
+            return j
+        ins = r.d["install"]
+        if w.package in ins["packages"] and re.search(ins["words"], shown):
+            j.install_title = self.store_title(w, pressed)
+        risk = self._word_risk(label, ids, w.package, j.payment,
+                               priced=priced(screen, w) or (drawn is not None and bool(amounts(drawn[1]))))
+        if risk is not None and risk.kind == "send" and not risk.money and shares_link(r, w) and \
+                is_self(r, row_label(t), screen):
+            risk = None  # an in-app share list's "Send" next to your own name, while a public link is shared
+        if risk is None:
+            slider = any(re.compile(r.d["slider_class"]).search(n.cls or "") for n in (pressed, t.hit) if n)
+            if slider or any_phrase(label, r.w["slide"]):
+                risk = Risk("pay" if j.payment else "other", "slider", money="terminal" if j.payment else None,
+                            grant=w.package if j.payment else None)
+        if risk is None and t.path and t.path[-1].truncated:
+            risk = Risk("other", "truncated")  # the phone couldn't read what's under the point: ask
+        money_app = bool(r.money_app.search(w.package or "")) or j.payment
+        if risk is None and amounts(near):
+            # A price drawn on or just under a drawn spot (a shop tile, "500 GEMS / $4.99"): a purchase (review 2 M3).
+            risk = Risk("pay", "drawn_price", money="start", grant=w.package)
+        if risk is None and money_app and not t.labeled() and not near:
+            risk = Risk("pay" if j.payment else "other", "unlabeled", money="terminal" if j.payment else None)
+        if risk is None and unread:
+            # A drawn spot whose words the phone couldn't read (capture or OCR failed or timed out): ask (review M3).
+            risk = Risk("other", "canvas_unread", wording=f"Allow tapping an unlabeled spot in {app_label}? The phone "
+                                                          "couldn't read what's drawn there.")
+        if risk is None and money_app and j.changing and not language_covered(r, screen) and not (
+                label and any_phrase(label, r.w["navigation"])):
+            risk = Risk("other", "language")
+        if risk is None and tier[0] == "ask":
+            risk = Risk("settings", "settings_page", always=True, grant=tier[1])
+        if risk is not None:
+            if not risk.wording:
+                risk.wording = wording()
+            if risk.grant is not None and risk.kind == "pay" and in_browser:
+                risk.grant = w.package
+        j.risk = risk
+        return j
+
+    def _slider_under(self, w: Window, x: float, y: float) -> bool:
+        """A slider or seekbar anywhere under (x, y) in the window, whatever the drawing order."""
+        rx = re.compile(self.r.d["slider_class"])
+        seen = [0]
+
+        def visit(n) -> bool:
+            seen[0] += 1
+            if seen[0] > 2000:
+                return False
+            if rx.search(n.cls or ""):
+                return True
+            return any(c.contains(x, y) and visit(c) for c in n.children)
+
+        return w.root is not None and w.root.contains(x, y) and visit(w.root)
+
+    @staticmethod
+    def _real_scroll(start: Target | None, x1, y1, x2, y2) -> bool:
+        """A mostly vertical drag over something that can really scroll that way: a node on the target's path whose
+        content can move in the drag's direction (a finger moving up scrolls the content down). Android's scroller
+        then takes the touch, so the words under the finger don't count. A class name alone (a ScrollView that can't
+        scroll, a ViewPager, a horizontal carousel) never counts (review H1, 2026-10-17)."""
+        if start is None or abs(y2 - y1) < 2 * abs(x2 - x1):
+            return False
+        need = "down" if y2 < y1 else "up"
+        return any(need in n.scroll for n in start.path)
+
+    def _judge_swipe(self, x1, y1, x2, y2, screen: Screen) -> Judgement:
+        r = self.r
+        start = hit_test(r, screen, x1, y1)
+        end = hit_test(r, screen, x2, y2)
+        pkg = start.window.package if start else ""
+        j = Judgement(package=pkg, changing=False,
+                      fp="#".join(t.fp(False) if t else "" for t in (start, end)),
+                      strict_fp="#".join(t.fp(True) if t else "" for t in (start, end)),
+                      money_fp="#".join(t.fp(True) + "|$" + ",".join(money_amounts(t.window, t)) if t else ""
+                                        for t in (start, end)),
+                      app=bool(start and self._app_window(start.window)))
+        for t in (start, end):
+            if t is None:
+                continue
+            if refusal := self._surface_refusal(t.window, t):
+                j.refuse = refusal
+                return j
+        for t in (start, end):
+            if t is not None and (pkg := self.blocked_notification(t.window, t, screen)):
+                j.package, j.refuse = pkg, self._notification_refusal(pkg)
+                return j
+        j.payment = payment_context(r, screen)
+        # A real scroll (mostly vertical, over something that can scroll that way: _real_scroll): the content under the
+        # finger moves, it isn't pressed, so its words don't make it risky; a slider under the start, or a control whose
+        # words say to slide or swipe it, still asks (Gatekeeper.judgeSwipe).
+        scroll = self._real_scroll(start, x1, y1, x2, y2)
+        # Every target under the start, as a tap is judged (review H1, 2026-10-17), each with its own path's scroll;
+        # then the end, judged with the start's. The strictest risk wins (the screen lock over a tap; on a tie, the
+        # first: the hit path's).
+        ends = [(start, scroll)] if start else []
+        if start is not None:
+            ends += [(a, self._real_scroll(a, x1, y1, x2, y2)) for a in targets_at(start.window, x1, y1)
+                     if not (a.pressed is start.pressed and a.hit is start.hit)]
+        if end is not None:
+            ends.append((end, scroll))
+        found = None
+        for t, scroll in ends:
+            label = t.label_tokens()
+            slider = any(re.compile(r.d["slider_class"]).search(n.cls or "") for n in (t.pressed, t.hit) if n) \
+                or any_phrase(label, r.w["slide"]) \
+                or (t is start and self._slider_under(t.window, x1, y1)) \
+                or (scroll and ("slide" in label or "swipe" in label))
+            risk = None if scroll else self._word_risk(label, t.ids(), t.window.package, j.payment)
+            if risk is None and slider:
+                money = j.payment or any_phrase(strip_phrases(label, r.w["pre_commit"]),
+                                                r.w["flow_start"] + r.w["terminal"])
+                risk = Risk("pay" if money else "other", "slider", money="terminal" if money else None,
+                            grant=t.window.package if money else None)
+            if risk is not None:
+                shown = t.shown()
+                risk.wording = f"Allow sliding “{shown}” in {self.label(screen, t.window.package)}?"
+                if found is None or (self.level(risk) == "fingerprint" and self.level(found) != "fingerprint"):
+                    found = risk
+        if found is not None:
+            j.risk = found
+            j.changing = True
+        return j
+
+    @staticmethod
+    def _focus_unread(screen: Screen) -> tuple:
+        """No field the gate can judge has focus: typing, ENTER and DELETE are refused by rule (review M2). A focus it
+        couldn't read (R1) says so; no focus at all says to tap the field."""
+        if screen.focus_expected:
+            return ("gate_screen_unstable", "builtin:focus_unread",
+                    "The field that has focus couldn't be read. Look again.")
+        return ("gate_screen_unstable", "builtin:no_field",
+                "No text field the phone can judge has focus. Tap the field first, then look again.")
+
+    def _judge_typing(self, text: str, screen: Screen, replace: bool = False) -> Judgement:
+        r = self.r
+        scheme = url_scheme(text)
+        if scheme in r.d["schemes"]["typed_refused"]:
+            return Judgement(changing=True, refuse=("gate_denied", "builtin:typed_scheme",
+                                                    f"{scheme}: text is never typed by agents."))
+        found = focused_field(screen)
+        if found is None:
+            return Judgement(changing=True, refuse=self._focus_unread(screen))
+        w, node, path = found
+        fp = f"{w.id}|{w.package}|{node.id}/{node.hint}/{node.cls}/{int(node.password)}"
+        j = Judgement(package=w.package, fp=fp, strict_fp=fp + "/" + ",".join(map(str, node.bounds)), changing=True,
+                      money_fp=fp + "/" + ",".join(map(str, node.bounds)) + "|$" + ",".join(money_amounts(w, None)),
+                      app=self._app_window(w), field_ref=field_ref(w, node))
+        if refusal := self._surface_refusal(w, None):
+            j.refuse = refusal
+            return j
+        if pkg := self.blocked_notification(w, Target(w, path), screen):
+            j.package, j.refuse = pkg, self._notification_refusal(pkg)
+            return j
+        if node.password:
+            j.refuse = ("gate_password_field", "builtin:password_field",
+                        "That's a password field. Agents never type passwords; ask the owner to type it.")
+            return j
+        if self._is_settings(w) and self._settings_tier(w, None, screen, [])[0] == "refuse":
+            j.refuse = ("gate_denied_page", "builtin:settings_security",
+                        "This Settings page is security-critical; agents can't change it.")
+            return j
+        j.payment = payment_context(r, screen)
+        about = f"{node.id} {node.hint}"
+        app = self.label(screen, w.package)
+        existing = "" if replace else (node.text or "")
+        # What the field will hold, exactly as the phone inserts it: at the cursor or over the selection (review L2).
+        result = typed_result(node.text or "", node.sel_start, node.sel_end, text, replace)
+        if self.call_app(w.package) and (self.completes_code(text) or self.completes_code(node.text + text)
+                                         or self.completes_code(result)):
+            # Some dialers run a code once its # is typed (H2).
+            code = result if self.completes_code(result) else node.text + text
+            j.risk = self._call_code_risk(code, app)
+        elif r.is_cat("browser", w.package) and (re.compile(r.d["url_bar"]).search(node.id or "")
+                                                  or looks_like_url(node.text)) \
+                and (link := self._new_sensitive_link(text, existing, result)) is not None:
+            # No data out through links (F3): a link carrying a card number or SSN is never typed into the address bar,
+            # whole or in pieces (review M4: the field's text plus the new text is judged too).
+            j.refuse = ("gate_denied", "builtin:sensitive_link", "That link carries "
+                        + describe_sensitive(link) + "; links never carry them out.")
+        elif re.compile(r.d["payment_field"]).search(about):
+            j.risk = Risk("fill", "card_field", always=True, wording=f"Allow typing into the card field in {app}?")
+        elif (kind := self._new_sensitive(text, existing, result, bool(r.ssn_label.search(f"{about} {node.desc}"))
+                                          or bool(r.ssn_label.search(screen_text(screen))))) is not None:
+            # A card number or SSN in any field (F2): asks at tap level, every time; never covered by a task approval,
+            # "everyday" or a grant; refused under Don't ask. Typed whole or in pieces: what the field will hold (its
+            # text plus the new text, or the new text alone for `replace`) is judged too (review M4, 2026-10-17).
+            what = describe_sensitive(kind)
+            fld = (node.hint or node.desc)[:40]
+            j.risk = Risk("sensitive_number", "sensitive_number", always=True,
+                          wording=f"Allow typing {what}" + (f" into “{fld}”" if fld else "") + f" in {app}?")
+        elif re.compile(r.d["otp_field"]).search(about):
+            j.risk = Risk("fill", "otp_field", always=True, wording=f"Allow typing a code into {app}?")
+        return j
+
+    @staticmethod
+    def _new_sensitive(text: str, existing: str, result: str, ssn_context: bool) -> str | None:
+        """A card number or SSN in the new text, or one the new text completes in the field (review M4, L2): the
+        field's result holds one its old text didn't, wherever the new text goes (a number already there, typed by
+        the owner, doesn't make others ask; another one does)."""
+        kind = find_sensitive(text, ssn_context=ssn_context)
+        if kind is None:
+            added = sensitive_set(result, ssn_context) - sensitive_set(existing, ssn_context)
+            if added:
+                kind = "card" if any(k == "card" for k, _ in added) else "ssn"
+        return find_sensitive(text, ssn_context=True) or kind if kind else None
+
+    def _new_sensitive_link(self, text: str, existing: str, result: str) -> str | None:
+        """The same for the address bar: a typed link carrying a card number or SSN, whole or completed in pieces."""
+        rx = self.r.ssn_label
+        if looks_like_url(text) and (kind := sensitive_in_url(text, rx)) is not None:
+            return kind
+        if existing and sensitive_in_url(existing, rx) is None and looks_like_url(result.strip()):
+            return sensitive_in_url(result, rx)
+        return None
+
+    def _sensitive_bar(self, screen: Screen):
+        """A browser's focused address bar holding a link that carries a card number or SSN: (window, node, kind)."""
+        found = focused_field(screen)
+        if found is None:
+            return None
+        w, node, _ = found
+        if not self.r.is_cat("browser", w.package) or not (re.search(self.r.d["url_bar"], node.id or "")
+                                                          or looks_like_url(node.text)):
+            return None
+        kind = sensitive_in_url(node.text, self.r.ssn_label)
+        return (w, node, kind) if kind else None
+
+    def _judge_key(self, name: str, screen: Screen) -> Judgement:
+        r = self.r
+        if name not in ("ENTER", "DELETE"):
+            return Judgement(changing=False)
+        found = focused_field(screen)
+        if found is None:
+            return Judgement(changing=name == "ENTER", refuse=self._focus_unread(screen))
+        w, node, path = found
+        fp = f"{w.id}|{w.package}|{node.id}/{node.hint}/{node.cls}"
+        j = Judgement(package=w.package, fp=fp, strict_fp=fp + "/" + ",".join(map(str, node.bounds)),
+                      money_fp=fp + "/" + ",".join(map(str, node.bounds)) + "|$" + ",".join(money_amounts(w, None)),
+                      changing=name == "ENTER", app=self._app_window(w), field_ref=field_ref(w, node))
+        if refusal := self._surface_refusal(w, None):
+            j.refuse = refusal
+            return j
+        if pkg := self.blocked_notification(w, Target(w, path), screen):
+            j.package, j.refuse = pkg, self._notification_refusal(pkg)
+            return j
+        if name == "DELETE":
+            return j
+        if w.package == r.surf["systemui"]:  # ENTER in a notification's reply field sends the reply (review 5 P5-M1)
+            j.risk = self._notification_risk("Allow sending a reply from a notification?")
+            return j
+        browser = r.is_cat("browser", w.package)
+        webview = any("WebView" in n.cls for n in path)
+        if browser and (re.compile(r.d["url_bar"]).search(node.id or "") or looks_like_url(node.text)):
+            url = node.text.strip()
+            if url_scheme(url) is None and looks_like_url(url):
+                url = "https://" + url
+            uj = self._judge_url(url, screen, "key")
+            uj.fp, uj.strict_fp, uj.changing = fp + "|" + uj.fp, j.strict_fp + "|" + uj.strict_fp, True
+            uj.field_ref = j.field_ref
+            return uj
+        j.payment = payment_context(r, screen)
+        app = self.label(screen, w.package)
+        if self.call_app(w.package):  # ENTER in a dialer's number field places the call (review H2)
+            number = node.text.strip()
+            j.risk = self._call_code_risk(number, app) if self.mmi(number) else Risk(
+                "call", "call:enter",
+                wording="Allow placing a call" + (f" to “{number[:40]}”" if number else "") + f" from {app}?")
+            return j
+        search = any(re.compile(r.d["search_field"]).search(v or "") for v in (node.id, node.cls, node.hint, node.desc))
+        if j.payment:
+            j.risk = Risk("pay", "enter:payment", money="terminal", grant=w.package,
+                          wording=f"Allow pressing Enter on a checkout in {app}?")
+        elif any(r.is_cat(c, w.package) for c in ("messaging", "email", "social")):
+            j.risk = Risk("send", "enter:messaging", grant=w.package, wording=f"Allow sending with Enter in {app}?")
+        elif (browser or webview) and not search:
+            j.risk = Risk("other", "enter:form", wording=f"Allow submitting a form with Enter in {app}?")
+        return j
+
+    def _judge_launch(self, package: str, screen: Screen) -> Judgement:
+        r = self.r
+        j = Judgement(package=package, fp=f"launch|{package}", strict_fp=f"launch|{package}", changing=True,
+                      app=True)
+        if package in r.own:
+            j.refuse = ("gate_blocked_app", "builtin:own_app", "OpenMob can't be opened by agents.")
+        elif package in r.installers:
+            j.refuse = ("gate_denied_page", "builtin:installer", "Installing apps is off-limits to agents.")
+        elif self.is_blocked(package):
+            j.refuse = ("gate_blocked_app", self.blocked_rule(package),
+                        f"Blocked on the phone: {package} is {self._blocked_what(package)}. Don't open it another way; "
+                        "call done.")
+        return j
+
+    def _judge_url(self, url: str, screen: Screen, method: str) -> Judgement:
+        r = self.r
+        scheme = url_scheme(url)
+        resolved = screen.resolve.get(url) or {}
+        handler = resolved.get("package") or ""
+        candidates = resolved.get("candidates") or ([handler] if handler else [])
+        fp = f"url|{scheme}|{handler}"
+        j = Judgement(package=handler, fp=fp, strict_fp=fp, changing=True, app=bool(handler))
+        if scheme is None or scheme not in r.d["schemes"]["allowed"]:
+            j.refuse = ("gate_denied", "builtin:url_scheme",
+                        f"{scheme or 'that'}: links aren't opened by agents (only https, http, tel, geo, mailto, "
+                        "sms and market).")
+            return j
+        if self.is_server_host(url):
+            j.refuse = OWN_SERVER_REFUSAL
+            return j
+        if (kind := sensitive_in_url(url, r.ssn_label)) is not None:
+            # No data out through links (F3): open_url, or ENTER on an address bar holding it. Refused, never asked.
+            j.refuse = ("gate_denied", "builtin:sensitive_link",
+                        f"That link carries {describe_sensitive(kind)}; links never carry them out.")
+            return j
+        targets = [handler] if handler else candidates
+        for pkg in targets:
+            if pkg in r.own or self.is_blocked(pkg):
+                owner = pkg not in r.own and not r.blocked(pkg)
+                j.refuse = ("gate_blocked_app", OWNER_BLOCKED if owner else "builtin:sensitive_apps",
+                            f"Blocked on the phone: that link opens {pkg}, "
+                            f"{self._blocked_what(pkg) if owner else 'a sensitive app'}. Call done.")
+                return j
+            if pkg in r.installers:
+                j.refuse = ("gate_denied_page", "builtin:installer", "Installing apps is off-limits to agents.")
+                return j
+        if scheme == "tel" and handler and not r.is_cat("dialer", handler):
+            j.refuse = ("gate_denied", "builtin:tel_handler", "tel: links only open the dialer.")
+        # A tel: link with * or # only opens the dialer too (owner, 2026-10-10): dialing the code asks, once.
+        return j
+
+
+# --- running the shared fixtures ------------------------------------------------------------------
+
+FIXTURES = ROOT / "tests/fixtures/gatekeeper"
+
+
+def load_fixtures(name: str) -> list[dict]:
+    return json.loads((FIXTURES / name).read_text())
+
+
+def load_screens() -> dict:
+    return json.loads((FIXTURES / "screens.json").read_text())
+
+
+def check(expect: dict, adm: Admission) -> list[str]:
+    problems = []
+    for key in ("decision", "code", "kind", "money", "level"):
+        if key in expect and getattr(adm, key) != expect[key]:
+            problems.append(f"{key}: expected {expect[key]!r}, got {getattr(adm, key)!r} ({adm.rule})")
+    if "rule" in expect and not adm.rule.startswith(expect["rule"]):
+        problems.append(f"rule: expected {expect['rule']!r}, got {adm.rule!r}")
+    return problems
+
+
+def run_step(gk: Gatekeeper, s: dict, screens: dict, state: dict) -> list[str]:
+    """One fixture step. `state` carries the last approval id and the saved remaining times."""
+    if "call" in s:
+        gk.clock.elapsed += state.get("call_ms", 1000)  # calls take time (an agent step is never instant)
+        screen = Screen.of(screens[s["screen"]])
+        adm = gk.admit(s["call"]["method"], s["call"].get("params") or {}, screen)
+        if adm.decision == "ask":
+            state["last"] = adm.approval_id
+        if adm.decision == "allow":
+            again = Screen.of(screens[s.get("reverify_screen", s["screen"])])
+            adm = gk.reverify(adm, again)
+            if adm.decision == "allow":
+                gk.completed(adm)  # the gesture ran
+        state["persist"] = gk.persist()
+        return check(s["expect"], adm)
+    if "approve" in s:
+        aid = state.get("last", "")
+        accepted = False
+        if aid in gk.pending:
+            message = gk.approval_message(aid, grant=bool(s.get("grant")))
+            if s.get("binding") == "other":
+                message = message.replace(gk.pending[aid].binding, sha256("another action"))
+            own, other = (TapVerifier, TestVerifier) if gk.pending[aid].level == "tap" else (TestVerifier, TapVerifier)
+            # valid: the level's own key; other_key: the other level's key (a tap can't approve a fingerprint prompt)
+            sig = {"valid": own.sign(message), "other_key": other.sign(message)}.get(s.get("sig"), "00")
+            accepted = gk.approve(aid, message, sig)
+        if accepted != s.get("expect_accepted", True):
+            return [f"approve: expected accepted={s.get('expect_accepted', True)}, got {accepted}"]
+        return []
+    if "deny" in s:
+        gk.deny(state.get("last", ""))
+        return []
+    if "cancel" in s:
+        gk.cancel(state.get("last", ""))
+        return []
+    if "shown" in s:
+        gk.mark_shown(state.get("last", ""))
+        return []
+    if "advance_ms" in s:
+        gk.clock.elapsed += int(s["advance_ms"])
+        gk.clock.wall += int(s["advance_ms"])
+        state["persist"] = gk.persist()  # the phone saves remaining times every minute
+        return []
+    if "set_wall_ms" in s:
+        gk.clock.wall = int(s["set_wall_ms"])
+        return []
+    if "reboot" in s:
+        r = s["reboot"]
+        gk.reboot(state.get("persist") if r.get("saved") else None, int(r["elapsed_after"]))
+        return []
+    if "policy" in s:
+        record = s["policy"]
+        message = f"gk1|policy|{policy_canon(record)}"
+        sig = {"valid": TestVerifier.sign(message), "bad": TestVerifier.sign(message + "x")}.get(s.get("sig"), "")
+        accepted = gk.add_policy(record, message, sig)
+        if accepted != s.get("expect_accepted", True):
+            return [f"policy: expected accepted={s.get('expect_accepted', True)}, got {accepted}"]
+        return []
+    if "instruction" in s:
+        gk.note_instruction(s["instruction"])
+        return []
+    if "stop" in s:
+        gk.revoke_all()
+        return []
+    if "resume" in s:
+        gk.resume()
+        return []
+    if "owner_blocked" in s:  # the host's stored list of apps the owner blocked (it survives a reboot: BlockedApps)
+        gk.owner_blocked = set(s["owner_blocked"])
+        return []
+    if "server" in s:  # the phone's paired server (review 5 H1: GateHost sets it from the pairing)
+        host = host_of(s["server"])
+        gk.server_hosts = {host} if host else set()
+        return []
+    return [f"unknown step {s}"]
+
+
+def run_scenario(scenario: dict, screens: dict, gk: Gatekeeper | None = None) -> list[str]:
+    gk = gk or Gatekeeper()
+    state: dict = {"call_ms": scenario.get("call_ms", 1000)}
+    out = []
+    for i, s in enumerate(scenario["steps"]):
+        out += [f"step {i}: {p}" for p in run_step(gk, s, screens, state)]
+    return out

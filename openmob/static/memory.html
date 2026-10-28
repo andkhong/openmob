@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What OpenMob remembers · OpenMob</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:wght@600&display=swap" rel="stylesheet">
+<script>try { const t = localStorage.getItem("openmob.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+<link rel="stylesheet" href="/static/ds.css">
+<style>
+  /* ---------- what OpenMob remembers ---------- */
+  .wrap { max-width: 720px; }
+  .card + .card { margin-top: 16px; }
+  form.add { display: grid; gap: 10px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .row .push { margin-left: auto; }
+  .card.pending { border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  h3 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 18px 0 4px; overflow-wrap: anywhere; font-family: var(--mono); }
+  ul.notes { list-style: none; margin: 0; padding: 0; }
+  ul.notes li { display: flex; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); }
+  ul.notes li:last-child { border-bottom: 0; }
+  ul.notes li .text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  ul.notes li .meta { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  ul.notes li .actions { display: flex; gap: 6px; flex: none; }
+  ul.notes li .edit { display: grid; gap: 6px; }
+  .note { font-size: 13px; color: var(--muted); }
+  @media (max-width: 560px) {
+    ul.notes li { flex-direction: column; align-items: stretch; gap: 8px; }
+    ul.notes li .actions { justify-content: flex-end; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><rect x="6.5" y="2.5" width="11" height="19" rx="3"/><path d="M10.5 18h3"/></svg></span>OpenMob<span class="page-name">What OpenMob remembers</span></a>
+  <nav class="topnav"><a class="btn btn-ghost" href="/">← Dashboard</a></nav>
+</header>
+<main class="page wrap">
+  <div class="page-head">
+    <h1>What OpenMob remembers</h1>
+    <p>Short notes your agent reads before a task: things about you, your apps, and the people you message. Nothing is saved until you say so: the agent can only suggest a note, and you choose Save or Not now. Edit or delete any note at any time. Your agent never types a phone number or email from a note: a person note names someone in your phone's contacts.</p>
+  </div>
+
+  <section class="card pending" id="pendingCard" hidden aria-labelledby="pendingTitle">
+    <h2 id="pendingTitle">Waiting for you <span class="count" id="pendingCount">0</span></h2>
+    <p class="note">Suggested while your agent worked. They are not used until you save them.</p>
+    <ul class="notes" id="pending"></ul>
+  </section>
+
+  <section class="card" aria-labelledby="addTitle">
+    <h2 id="addTitle">Add a note</h2>
+    <form class="add" id="addForm">
+      <input class="input" type="text" id="addText" maxlength="300" placeholder="e.g. I prefer dark mode" aria-label="Note">
+      <div class="row">
+        <select id="addKind" aria-label="What the note is about">
+          <option value="about_you">About you</option>
+          <option value="person">A person</option>
+          <option value="app">An app</option>
+        </select>
+        <input class="input" type="text" id="addRelation" maxlength="40" placeholder="Relation, e.g. sis" aria-label="Relation" hidden style="flex:1; min-width:140px">
+        <input class="input" type="text" id="addContact" maxlength="80" placeholder="Name in your contacts" aria-label="Contact name" hidden style="flex:1; min-width:160px">
+        <input class="input" type="text" id="addApp" placeholder="App package, e.g. com.google.android.youtube" aria-label="App package" hidden style="flex:1; min-width:200px">
+        <button class="btn btn-primary push" type="submit">Save note</button>
+      </div>
+    </form>
+    <p class="error" id="error" role="alert"></p>
+  </section>
+
+  <section class="card" aria-labelledby="userTitle">
+    <h2 id="userTitle">About you <span class="count" id="userCount">0</span></h2>
+    <ul class="notes" id="userNotes"></ul>
+  </section>
+
+  <section class="card" aria-labelledby="peopleTitle">
+    <h2 id="peopleTitle">People <span class="count" id="peopleCount">0</span></h2>
+    <ul class="notes" id="peopleNotes"></ul>
+  </section>
+
+  <section class="card" aria-labelledby="appTitle">
+    <h2 id="appTitle">Apps <span class="count" id="appCount">0</span></h2>
+    <div id="appNotes"></div>
+  </section>
+</main>
+<script>
+// Notes are the owner's own words but still user-controlled text: textContent only, never innerHTML.
+const $ = (id) => document.getElementById(id);
+let notes = [], proposed = [];
+
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...children);
+  return node;
+}
+
+// Token mode (no accounts): the server's token rides along as on the dashboard (from the link's ?t=).
+const token = new URLSearchParams(location.search).get("t") || "";
+if (token) for (const a of document.querySelectorAll('a[href="/"]')) a.href = `/?t=${encodeURIComponent(token)}`;
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { credentials: "same-origin", ...opts,
+    headers: { "Content-Type": "application/json", "X-OpenMob-Token": token } });
+  if (res.status === 401) {
+    if (token) throw new Error("Bad token: open the link printed by `openmob run`.");
+    location.href = "/login?next=" + encodeURIComponent("/memory"); throw new Error("signed out");
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const body = await res.json(); if (typeof body.detail === "string") detail = body.detail; } catch {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+const fail = (e) => { if (e.message !== "signed out") $("error").textContent = e.message; };
+
+// A person note reads "your sis = Maya — birthday is May 3": the relation and the contact are always shown.
+const label = (n) => n.kind === "person" ? `your ${n.relation} = ${n.contact_name} — ${n.text}` : n.text;
+
+function noteRow(n) {
+  const li = el("li");
+  const text = el("div", { className: "text" }, label(n));
+  const actions = el("div", { className: "actions" });
+  li.append(text, actions);
+  if (n.status === "proposed") {
+    // Where the suggestion came from (review 5 M5-L3): the screen, not the owner's words; and an app note's app.
+    const origin = [n.source === "agent" ? "Suggested from what the agent saw on screen" : "",
+                    n.kind === "app" && n.package ? `About the app ${n.package}` : ""].filter(Boolean).join(" · ");
+    if (origin) text.append(el("span", { className: "meta", textContent: origin }));
+    const save = el("button", { className: "btn btn-sm btn-primary", type: "button", textContent: "Save" });
+    const no = el("button", { className: "btn btn-sm", type: "button", textContent: "Not now" });
+    save.onclick = () => change(() => api(`/api/memory/${n.id}/confirm`, { method: "POST" }));
+    no.onclick = () => change(() => api(`/api/memory/${n.id}/dismiss`, { method: "POST" }));
+    actions.append(save, no);
+    return li;
+  }
+  const edit = el("button", { className: "btn btn-sm", type: "button", textContent: "Edit" });
+  edit.onclick = () => {
+    const box = el("div", { className: "edit" });
+    const input = el("input", { className: "input", type: "text", value: n.text, maxLength: 300 });
+    input.setAttribute("aria-label", "Note text");
+    box.append(input);
+    let contact = null;
+    if (n.kind === "person") {
+      contact = el("input", { className: "input", type: "text", value: n.contact_name || "", maxLength: 80 });
+      contact.setAttribute("aria-label", "Contact name");
+      box.append(contact);
+    }
+    const save = el("button", { className: "btn btn-sm btn-primary", type: "button", textContent: "Save" });
+    const cancel = el("button", { className: "btn btn-sm", type: "button", textContent: "Cancel" });
+    save.onclick = () => change(() => api(`/api/memory/${n.id}`, { method: "PATCH",
+      body: JSON.stringify(contact ? { text: input.value, contact_name: contact.value } : { text: input.value }) }));
+    cancel.onclick = render;
+    input.onkeydown = (e) => { if (e.key === "Enter") save.click(); if (e.key === "Escape") render(); };
+    text.replaceChildren(box);
+    actions.replaceChildren(save, cancel);
+    input.focus();
+  };
+  const del = el("button", { className: "btn btn-sm btn-danger", type: "button", textContent: "Delete" });
+  del.onclick = () => change(() => api(`/api/memory/${n.id}`, { method: "DELETE" }));
+  actions.append(edit, del);
+  return li;
+}
+
+const empty = (msg) => el("li", { className: "empty-state" }, msg);
+
+function render() {
+  $("pendingCard").hidden = !proposed.length;
+  $("pendingCount").textContent = proposed.length;
+  $("pending").replaceChildren(...proposed.map(noteRow));
+  const you = notes.filter((n) => n.kind === "about_you");
+  const people = notes.filter((n) => n.kind === "person");
+  const apps = notes.filter((n) => n.kind === "app");
+  $("userCount").textContent = you.length;
+  $("userNotes").replaceChildren(...(you.length ? you.map(noteRow) : [empty("Nothing yet. Add a note above, or save one your agent suggests.")]));
+  $("peopleCount").textContent = people.length;
+  $("peopleNotes").replaceChildren(...(people.length ? people.map(noteRow) : [empty("Nothing yet. A person note links a relation (\"sis\") to a name in your contacts.")]));
+  $("appCount").textContent = apps.length;
+  const byApp = {};
+  for (const n of apps) (byApp[n.package] ||= []).push(n);
+  $("appNotes").replaceChildren(...(apps.length ? Object.entries(byApp).flatMap(([pkg, list]) =>
+    [el("h3", { textContent: pkg }), el("ul", { className: "notes" }, ...list.map(noteRow))])
+    : [el("p", { className: "empty-state", textContent: "Nothing yet. Notes about how one of your apps works show up here." })]));
+}
+
+async function load(auto = false) {
+  // A background refresh must not wipe a note being edited.
+  if (auto && document.activeElement && document.activeElement.closest("li")) return;
+  try { const r = await api("/api/memory"); notes = r.notes; proposed = r.proposed; $("error").textContent = ""; render(); } catch (e) { fail(e); }
+}
+
+async function change(call) {
+  $("error").textContent = "";
+  try { await call(); } catch (e) { fail(e); }
+  load();
+}
+
+$("addKind").onchange = () => {
+  const k = $("addKind").value;
+  $("addRelation").hidden = $("addContact").hidden = k !== "person";
+  $("addApp").hidden = k !== "app";
+};
+$("addForm").onsubmit = (ev) => {
+  ev.preventDefault();
+  const text = $("addText").value.trim();
+  if (!text) return;
+  const kind = $("addKind").value;
+  const body = { text, kind };
+  if (kind === "app") body.package = $("addApp").value.trim();
+  if (kind === "person") { body.relation = $("addRelation").value.trim(); body.contact_name = $("addContact").value.trim(); }
+  change(async () => { await api("/api/memory", { method: "POST", body: JSON.stringify(body) }); $("addText").value = ""; });
+};
+
+load();
+setInterval(() => load(true), 15000);
+</script>
+</body>
+</html>

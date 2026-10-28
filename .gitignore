@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+config.yaml
+*.jpg
+*.png
+deploy/OpenMob.apk
+!deploy/config.yaml
+
+# Claude Code agents work in private checkouts here
+.claude/worktrees/
+
+# openmob bench-api results
+bench-results/
+
+# Private settings and API keys (.env.example is the committed template)
+.env
+.env.*
+!.env.example

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMob safety</title>
+<meta name="description" content="What OpenMob's Faster mode sends to TypeSafe, what it never sends, and how to turn it off.">
+<script>try { const t = localStorage.getItem("openmob.theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
+<link rel="stylesheet" href="/static/ds.css">
+<style>
+body { margin: 0; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; line-height: 1.6; }
+h1 { font-size: 28px; margin: 0 0 8px; }
+h2 { font-size: 21px; margin: 32px 0 8px; }
+li { margin: 6px 0; }
+.warning { border-left: 3px solid var(--line-strong); padding: 10px 14px; background: var(--surface); border-radius: 6px; }
+.muted { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>OpenMob safety</h1>
+  <p class="muted">The full version, with approvals, permission modes and data handling, is docs/safety.md in the
+    OpenMob source. This page covers what your phone's app links to.</p>
+
+  <h2 id="faster-mode">Faster mode</h2>
+  <p><b>Off by default.</b> While it's on, OpenMob may send <b>small screenshots (768 px)</b> of what the agent is
+    looking at to <b>TypeSafe</b> (Jev), a second AI service, to recognise screens faster: on screens with no
+    readable text (games, canvas pages) and on sparse game screens (a few labels around a play area a game draws
+    itself), a loading screen is waited out without asking the main model, and the wait ends as soon as the screen
+    is ready.</p>
+  <p><b>Sparse screens are games only.</b> A screen with a few labels counts as sparse only in a game: an app whose
+    package name says it is one (a "game" package, chess, Tetris, sudoku, solitaire, or a known game maker such as
+    Supercell or King), an app on the server owner's <code>games</code> list, or a screen drawn by a game engine
+    (Unity, Unreal, Godot, Cocos). Any other app's labeled screens are never sent: not video calls, photo editors,
+    notes, browser pages, Google Lens or video players, and never camera, photos, messaging, email, social,
+    contacts, files or document apps, or account sheets. The cost: a canvas outside a game, such as a browser game
+    in Chrome or a drawing app, gets no Faster mode on its labeled screens, and neither does a game OpenMob doesn't
+    recognise until it is on the <code>games</code> list.</p>
+  <p><b>Jev taps.</b> On a game's menu, pop-up or game-over screen, Jev may also <b>tap a routine control</b> (Play,
+    Continue, a pop-up's X) without the main model. For that, <b>your request's text goes to TypeSafe with the
+    screenshot.</b> Jev never taps when the screen shows a price, money or confirm words, an offer, an ad, a reward
+    or in-game currency anywhere on it; at most 3 in a row; and each tap goes through the same checks, and the same
+    phone gatekeeper, as any other tap. A tap that leaves the game counts as a miss. Never in drive sessions, Ask
+    every step or Plan first, and Jev never finishes a task.</p>
+  <p class="warning">Faster mode sends screenshots of what the agent is looking at to TypeSafe, a second AI service, so
+    it can recognize screens faster. On routine game screens, TypeSafe may also tap a start, continue or close button itself, through the same checks as the agent's taps; for that, your request's text goes with the screenshot.
+    Banking, wallet and password apps, and screens the phone blacks out, are never sent. OpenMob blocks banking apps
+    and detected card and ID numbers, but it can't recognize every sensitive image. You can turn this off at any
+    time.</p>
+  <p><b>Approvals given before 2026-10-17 count as off.</b> The warning grew (Jev taps, the request text), so turn
+    Faster mode on again on the phone, and approve drive keys again, to keep using it.</p>
+  <ul>
+    <li><b>Only you turn it on, on the phone,</b> in the OpenMob app's Faster mode card, with your screen lock:
+      <b>Turn on for this session</b> or <b>Always on this phone</b>. An API key, the dashboard, a drive client or
+      the server's settings can't turn it on.</li>
+    <li><b>This session only</b> lasts until you disconnect (the app's Disconnect or the notification's Stop) or
+      the phone has been idle for an hour (no task or drive session). A network blip of up to 5 minutes keeps it on,
+      once the phone re-confirms the grant you signed.</li>
+    <li><b>Always on this phone</b> lasts until you turn it off or disconnect (the app's Disconnect or the
+      notification's Stop). A network drop or a restart keeps it on.</li>
+    <li><b>Turning it off is one tap, no lock:</b> in the app, on the ongoing notification ("Faster mode is on" →
+      Turn off Faster mode), on the dashboard, or over the API. It takes effect from the next look.</li>
+    <li><b>Never sent, even when it's on:</b> banking, payment, wallet and password-manager apps and any app blocked
+      for the task; black or secure screens, unidentified windows and system dialogs the phone hides; the lock
+      screen; screens with a password field; screens whose text shows a card number, a Social Security number or a
+      one-time code; the notification shade; and screens with readable text, except sparse game screens. Camera,
+      photos and gallery, messaging, email, social, contacts, files, document and PDF apps, Google Play services
+      and account sheets are never treated as sparse game screens, and neither is any app that isn't a game (see
+      above).</li>
+    <li><b>A server without OCR sends nothing.</b> Before an image goes out, the server reads the screen's words to
+      check for card and ID numbers. A server that can't (OCR is macOS-only today) never sends one; the dashboard
+      says "Faster mode is on but inactive on this server".</li>
+    <li><b>Drive sessions</b> (an outside agent at the controls) send nothing unless you approved that API key on the
+      phone, with your screen lock.</li>
+    <li><b>Every change is logged</b>, with who and when, and every step records whether a screenshot went to
+      TypeSafe.</li>
+    <li><b>What it can't promise:</b> the server enforces all of this. A compromised server could ignore it and send
+      screenshots anyway, as it could with any screenshot it handles.</li>
+  </ul>
+</main>
+</body>
+</html>
