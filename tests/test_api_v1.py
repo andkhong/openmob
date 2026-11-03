@@ -385,6 +385,22 @@ def test_concurrent_task_cap(api):
     run_task(api.alice, "open maps")
 
 
+def test_a_task_whose_status_reads_final_frees_its_slot_at_once(api):
+    # The status turns final a moment before the task's last log entry frees its slot (seen in CI): a client that
+    # saw "cancelled" and starts the next task must not get too_many_tasks.
+    api.cfg.api_max_concurrent_tasks = 1
+    first = run_task(api.alice, "wait a bit")
+    coordinator = api.manager.get(api.alice.device).coordinator
+    with coordinator._lock:
+        coordinator.task_info[first["id"]]["status"] = "cancelled"  # final, its last entry not yet recorded
+    assert api.alice.v1.get("/v1/limits").json()["concurrent_tasks"]["used"] == 0
+    second = run_task(api.alice, "open maps")
+    with coordinator._lock:
+        coordinator.task_info[first["id"]]["status"] = "running"
+    for task in (first, second):
+        api.alice.v1.post(f"/v1/tasks/{task['id']}/cancel")
+
+
 def test_daily_quota(api):
     api.cfg.api_daily_tasks = 1
     run_task(api.alice, "open maps")

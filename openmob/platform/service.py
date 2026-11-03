@@ -564,10 +564,9 @@ class V1Service:
         """The per-key and per-account caps a new task (or drive session) must fit under: unfinished tasks,
         tasks and credits today."""
         account_id, key_id = p.account_id, p.id
-        with self._lock:
-            if len(self.active.get(key_id, ())) >= self.cfg.api_max_concurrent_tasks:
-                raise RateLimited(f"This key already has {self.cfg.api_max_concurrent_tasks} unfinished "
-                                  "tasks. Wait for one to finish or cancel it.", code="too_many_tasks")
+        if self._unfinished(p) >= self.cfg.api_max_concurrent_tasks:
+            raise RateLimited(f"This key already has {self.cfg.api_max_concurrent_tasks} unfinished "
+                              "tasks. Wait for one to finish or cancel it.", code="too_many_tasks")
         resets_at = day_start() + 86400  # daily limits reset at midnight UTC
         reset = {"retry_after": max(1, int(resets_at - time.time())), "extra": {"resets_at": resets_at}}
         if self.ledger.tasks_today(key_id) >= self.cfg.api_daily_tasks:
@@ -581,6 +580,17 @@ class V1Service:
                 and self.account_credits_today(account_id) >= self.cfg.api_account_daily_credits):
             raise RateLimited("Daily credit limit reached for this account.", code="account_credits_exhausted",
                               **reset)
+
+    def _unfinished(self, p: Principal) -> int:
+        """This key's unfinished tasks. A task whose status already reads final is finished, even before its
+        last log entry frees its slot: a client that saw "cancelled" may start the next one at once."""
+        with self._lock:
+            ids = list(self.active.get(p.id, ()))
+        finished = 0
+        for task_id in ids:
+            live = self._live(p.account_id, task_id)
+            finished += bool(live and live[1] and live[1]["status"] in FINAL_STATUSES)
+        return len(ids) - finished
 
     def _register(self, task_id: str, meta: dict) -> None:
         with self._lock:
@@ -768,8 +778,7 @@ class V1Service:
     def limits(self, p: Principal) -> dict:
         """This key's limits and today's use. Daily limits reset at midnight UTC (resets_at)."""
         c = self.cfg
-        with self._lock:
-            running = len(self.active.get(p.id, ()))
+        running = self._unfinished(p)
         return {
             "requests_per_minute": c.api_rate_per_minute,
             "concurrent_tasks": {"limit": c.api_max_concurrent_tasks, "used": running},

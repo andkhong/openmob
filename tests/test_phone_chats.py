@@ -15,6 +15,7 @@ def _paired(srv, email, device):  # noqa: F811
     phone = FakePhone(srv.ws, FakeDriver(), device_id=device, key=key)
     assert phone.welcome.wait(5)
     session = srv.manager.sessions[f"app-{device}"]
+    phone.session = session
     return user, phone, session
 
 
@@ -28,6 +29,9 @@ def _ask(phone, message, reply_type, count=None):
 def _run(phone, text):
     phone.send({"type": "command", "text": text})
     assert wait_for(lambda: any(k == "result" and "ok" in m for k, m in phone.events))
+    # The phone hears the result a moment before the server lets the task go (CI saw "busy" in between).
+    session = getattr(phone, "session", None)  # set by _paired and _paired_same
+    assert session is None or wait_for(lambda: session.coordinator.current is None)
     phone.events.clear()
 
 
@@ -148,6 +152,7 @@ def _paired_same(srv, user, device):  # noqa: F811
     key = srv.claim(user.post("/api/pairing").json()["code"], device).json()["key"]
     phone = FakePhone(srv.ws, FakeDriver(), device_id=device, key=key)
     assert phone.welcome.wait(5)
+    phone.session = srv.manager.sessions[f"app-{device}"]
     return phone
 
 
