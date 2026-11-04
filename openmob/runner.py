@@ -658,7 +658,9 @@ class Coordinator:
                 },
                 "task_id": self.current_task,
                 # Stop was pressed and the task is winding down (the dashboard says "Stopping…" until it ends).
-                "stopping": bool(self.current is not None and self.cancel.is_set()),
+                # Not once the task reads finished: that comes a moment before it stops being current.
+                "stopping": bool(self.current is not None and self.cancel.is_set()
+                                 and not (self.task_info.get(self.current_task) or {}).get("finished")),
                 "permission_mode": self.current_mode,
                 "chat_id": self.chat_id,
                 "log": list(self.log)[-400:],

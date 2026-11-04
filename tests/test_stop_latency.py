@@ -386,3 +386,20 @@ def test_the_status_says_stopping_at_once(tmp_path, phone_loop):
     assert snap["stopping"] is True or snap["task_id"] is None
     wait_final(c, task)
     assert c.snapshot()["stopping"] is False
+
+
+def test_the_status_stops_saying_stopping_once_the_task_reads_finished(tmp_path, phone_loop):
+    # The task's record turns finished a moment before it stops being current (CI caught "stopping" in between).
+    driver, sock = remote_phone(phone_loop)
+    client = SlowClient([[tool_use("done", "a", summary="ok", success=True)]])
+    c = coordinator_with(lambda io: make_agent(client, driver, io, tmp_path))
+    task = c.enqueue("anything", "dashboard")
+    assert client.started.wait(5)
+    c.stop()
+    with c._lock:
+        assert c.current is not None  # still current: the window
+        c.task_info[task]["finished"] = time.time()
+    assert c.snapshot()["stopping"] is False
+    with c._lock:
+        c.task_info[task]["finished"] = None
+    wait_final(c, task)

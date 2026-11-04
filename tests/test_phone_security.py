@@ -108,6 +108,12 @@ def start_cart(h, device_id):
     assert wait_for(lambda: h.status(device_id) == "needs_confirmation")
 
 
+def last_request(phone):
+    """The phone's latest approval request: the status can read needs_confirmation before it arrives."""
+    assert wait_for(lambda: phone.approval_requests)
+    return phone.approval_requests[-1]
+
+
 # --- T5: a leaked device key ---------------------------------------------------------------------
 
 
@@ -125,7 +131,7 @@ def test_t5_a_leaked_key_cant_approve_and_the_real_socket_is_told(h):
     assert not wait_for(lambda: h.status(h.ids.a2) == "succeeded", timeout=1.0)  # …but its yes is ignored
     assert not any(a[0] == "tap" for a in h.pa2.driver.actions)
     # The real owner can still approve on the other phone, with its screen lock.
-    request = h.pa2.approval_requests[-1]
+    request = last_request(h.pa2)
     h.pa2.send(h.pa2.approval(request["id"], request["task_id"], True))
     assert wait_for(lambda: h.status(h.ids.a2) == "succeeded")
 
@@ -167,7 +173,7 @@ def test_t7_unpairing_closes_every_socket(h):
 def test_t8_another_accounts_phone_cant_answer_an_approval(h):
     start_cart(h, h.ids.a2)
     assert wait_for(lambda: h.pa2.approval_requests)
-    request = h.pa2.approval_requests[-1]
+    request = last_request(h.pa2)
     h.pb1.send(h.pb1.approval(request["id"], request["task_id"], True))  # validly signed, by Bob's phone
     assert not wait_for(lambda: h.status(h.ids.a2) == "succeeded", timeout=1.0)
     assert not h.pb1.approval_requests
@@ -216,7 +222,7 @@ def test_a_replaced_socket_from_elsewhere_alerts_the_owner(h):
 
 def test_signed_approval_works(h):
     start_cart(h, h.ids.a1)
-    request = h.pa1.approval_requests[-1]
+    request = last_request(h.pa1)
     h.pa1.send(h.pa1.approval(request["id"], request["task_id"], True))
     assert wait_for(lambda: h.status(h.ids.a1) == "succeeded")
 
@@ -224,7 +230,7 @@ def test_signed_approval_works(h):
 @pytest.mark.parametrize("forge", ["unsigned", "bad_signature", "other_key", "stale", "other_approval"])
 def test_unsigned_or_forged_approvals_are_rejected(h, forge):
     start_cart(h, h.ids.a1)
-    request = h.pa1.approval_requests[-1]
+    request = last_request(h.pa1)
     approval_id, task_id = request["id"], request["task_id"]
     now = int(time.time())
     message = {"type": "approval", "id": approval_id, "approved": True, "timestamp": now}
@@ -251,7 +257,7 @@ def test_an_app_phone_without_an_approval_key_can_only_decline(h):
     assert p.welcome.wait(5)
     h.alice.post(f"/api/devices/app-{old_app}/command", json={"text": "check the cart"})
     assert wait_for(lambda: p.approval_requests)
-    request = p.approval_requests[-1]
+    request = last_request(p)
     assert request["can_approve"] is False and "can only decline" in request["cannot_approve_reason"]
     assert request["signature_required"] is True
     assert wait_for(lambda: any("can't approve yet" in m for k, m in p.events if k == "status"))
@@ -269,7 +275,7 @@ def test_an_old_app_signing_without_the_action_digest_is_refused(h):
     p = h.connect(old_app, key, signer, legacy_signing=True)  # signs `id|task|true|ts`, as before
     assert p.welcome.wait(5)
     start_cart(h, old_app)
-    request = p.approval_requests[-1]
+    request = last_request(p)
     p.send(p.approval(request["id"], request["task_id"], True))
     assert not wait_for(lambda: h.status(old_app) == "succeeded", timeout=1.0)
     assert not any(a[0] == "tap" for a in p.driver.actions)
@@ -279,7 +285,7 @@ def test_a_signed_approval_for_one_action_does_not_authorize_another(h):
     from openmob.phone.approval_keys import action_digest
 
     start_cart(h, h.ids.a1)
-    request = h.pa1.approval_requests[-1]
+    request = last_request(h.pa1)
     # The request names the action (the tool, the app, the target) and its digest; the phone signs that.
     assert request["action"]["tool"] == "tap" and request["digest"] == action_digest(request["action"])
     other = action_digest({**request["action"], "text": "Buy 10 now"})
@@ -297,7 +303,7 @@ def test_an_approval_does_not_cover_a_screen_that_changed_while_asking(h):
     driver = h.pa1.driver
     driver.elements = [UIElement(0, "Buy now", "", "buy", "Button", True, None, (0, 0, 200, 100))]
     start_cart(h, h.ids.a1)
-    request = h.pa1.approval_requests[-1]
+    request = last_request(h.pa1)
     assert request["action"]["text"] == "Buy now"
     # Before the owner answers, the page swaps the button under the same spot.
     driver.elements = [UIElement(0, "Subscribe yearly", "", "buy", "Button", True, None, (0, 0, 200, 100))]
@@ -340,7 +346,7 @@ def test_an_untrusted_phone_gets_no_requests_for_other_phones_and_cant_approve_t
     assert wait_for(lambda: h.pa1.approval_requests)
     assert not wait_for(lambda: h.pa2.approval_requests, timeout=1.0)  # not fanned out to the new phone
     # Even knowing the request id, its signed yes is rejected server-side.
-    request = h.pa1.approval_requests[-1]
+    request = last_request(h.pa1)
     h.pa2.send(h.pa2.approval(request["id"], request["task_id"], True))
     assert not wait_for(lambda: h.status(h.ids.a1) == "succeeded", timeout=1.0)
     assert not any(a[0] == "tap" for a in h.pa1.driver.actions)
@@ -351,7 +357,7 @@ def test_an_untrusted_phone_gets_no_requests_for_other_phones_and_cant_approve_t
 def test_an_untrusted_phone_can_approve_its_own_actions(h):
     start_cart(h, h.ids.a2)
     assert wait_for(lambda: h.pa2.approval_requests)
-    request = h.pa2.approval_requests[-1]
+    request = last_request(h.pa2)
     h.pa2.send(h.pa2.approval(request["id"], request["task_id"], True))
     assert wait_for(lambda: h.status(h.ids.a2) == "succeeded")
 
@@ -361,7 +367,7 @@ def test_one_click_on_the_dashboard_trusts_it(h):
     assert h.bob.post(f"/api/devices/app-{h.ids.a2}/trust", json={"password": "password123"}).status_code == 404  # not Bob's phone
     start_cart(h, h.ids.a1)
     assert wait_for(lambda: h.pa2.approval_requests)  # now it's asked too…
-    request = h.pa2.approval_requests[-1]
+    request = last_request(h.pa2)
     h.pa2.send(h.pa2.approval(request["id"], request["task_id"], True))  # …and its yes counts
     assert wait_for(lambda: h.status(h.ids.a1) == "succeeded")
     acct = h.store.account_id_for("alice@example.com")
@@ -451,7 +457,7 @@ def test_a_trust_signature_and_an_approval_signature_cant_stand_in_for_each_othe
     assert not verify_trust(pub, f"{h.ids.a2}|x", now, _sign(signer, trust_message(f"{h.ids.a2}|x", now)))
     # Over the wire: a trust signature sent as a yes is ignored…
     start_cart(h, h.ids.a1)
-    request = h.pa1.approval_requests[-1]
+    request = last_request(h.pa1)
     h.pa1.send({"type": "approval", "id": request["id"], "approved": True, "timestamp": now,
                 "signature": _sign(signer, trust_message(h.ids.a2, now))})
     assert not wait_for(lambda: h.status(h.ids.a1) == "succeeded", timeout=1.0)
@@ -470,8 +476,8 @@ def test_a_trusted_phone_signs_each_yes_over_the_digest_with_its_own_key(h):
     h.alice.post(f"/api/devices/app-{h.ids.a2}/trust", json={"password": "password123"})
     start_cart(h, h.ids.a1)
     assert wait_for(lambda: h.pa2.approval_requests)
-    request = h.pa2.approval_requests[-1]
-    assert request["digest"] == h.pa1.approval_requests[-1]["digest"]
+    request = last_request(h.pa2)
+    assert request["digest"] == last_request(h.pa1)["digest"]
     h.pa2.send({"type": "approval", "id": request["id"], "approved": True})  # unsigned
     h.pa2.send(h.pa2.approval(request["id"], request["task_id"], True, digest="0" * 64))  # another action
     from test_remote import sign_approval
